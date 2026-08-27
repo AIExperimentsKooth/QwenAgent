@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from datetime import datetime
 from openai import OpenAI
 
 # ── ANSI colors ────────────────────────────────────────────────────────
@@ -20,11 +21,133 @@ RESET = "\033[0m"
 
 # ── config ─────────────────────────────────────────────────────────────
 BASE_URL = os.environ.get("QWEN_API_BASE", "http://100.64.2.163:1234/v1")
-MODEL = os.environ.get("QWEN_MODEL", None)  # optional override; None = auto-detect
-API_KEY = os.environ.get("QWEN_API_KEY", "")  # the endpoint doesn't need one
-MAX_TOOL_ROUNDS = 12  # safety limit
+MODEL = os.environ.get("QWEN_MODEL", None)
+API_KEY = os.environ.get("QWEN_API_KEY", "")
+MAX_TOOL_ROUNDS = 30  # safety limit
+SESSIONS_DIR = os.path.expanduser("~/qwenAgent/sessions")
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
+
+
+# ── session persistence ─────────────────────────────────────────────────
+
+SESSION_IGNORE_ROLES = {"system", "assistant"}
+MAX_SESSION_DISPLAY = 1024
+
+
+def session_path(name):
+    return os.path.join(SESSIONS_DIR, f"{name}.json")
+
+
+def list_sessions():
+    """Return sorted list of (name, timestamp, preview)."""
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    sessions = []
+    for fname in sorted(os.listdir(SESSIONS_DIR), reverse=True):
+        if not fname.endswith(".json"):
+            continue
+        name = fname[:-5]
+        path = os.path.join(SESSIONS_DIR, fname)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            ts = data.get("timestamp", "?")
+            msgs = data.get("messages", [])
+            # Find the first user message after the system prompt
+            preview = ""
+            for m in msgs:
+                if m.get("role") == "user" and m.get("content"):
+                    preview = m["content"][:MAX_SESSION_DISPLAY]
+                    break
+            sessions.append((name, ts, preview))
+        except Exception:
+            sessions.append((name, "?", "(corrupt)"))
+    return sessions
+
+
+def save_session(name, messages):
+    """Save current messages + metadata to sessions/{name}.json."""
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    # Strip tool results and parsing-noise — save only user/assistant turns for resume
+    clean = [
+        m for m in messages
+        if m.get("role") in ("system", "user", "assistant")
+    ]
+    # Also strip the "If the task is complete" follow-ups the loop injects
+    stripped = []
+    for m in clean:
+        if m["role"] == "user" and m["content"].startswith("Tool result:"):
+            continue
+        if m["role"] == "user" and m["content"].startswith("Your response was not parseable"):
+            continue
+        if m["role"] == "user" and m["content"].startswith("Tool '"):
+            continue
+        if m["role"] == "user" and m["content"].startswith("If the task is complete"):
+            continue
+        if m["role"] == "system" and "tool rounds" in m.get("content", ""):
+            continue
+        stripped.append(m)
+
+    data = {
+        "version": 1,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model": MODEL,
+        "endpoint": BASE_URL,
+        "messages": stripped,
+    }
+    with open(session_path(name), "w") as f:
+        json.dump(data, f, indent=2)
+    return name
+
+
+def load_session(name):
+    """Load a saved session. Returns messages list or None."""
+    path = session_path(name)
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("messages", [])
+
+
+def delete_session(name):
+    path = session_path(name)
+    if os.path.isfile(path):
+        os.remove(path)
+
+
+def pick_session():
+    """Show saved sessions and let the user pick one to resume. Returns messages or None."""
+    sessions = list_sessions()
+    if not sessions:
+        return None
+
+    print(f"\n  Saved sessions ({len(sessions)}):")
+    print(f"  {'':─>60}")
+    for i, (name, ts, preview) in enumerate(sessions):
+        short = preview[:128].replace("\n", " ") if preview else "(empty)"
+        print(f"  [{i}] {name}  ({ts})")
+        print(f"      {GOLD}{short}{RESET}")
+    print(f"  [n] Start fresh")
+    print()
+
+    while True:
+        try:
+            choice = input("  Resume session [0]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if choice.lower() in ("", "n"):
+            return None
+        try:
+            idx = int(choice)
+            if 0 <= idx < len(sessions):
+                msgs = load_session(sessions[idx][0])
+                if msgs:
+                    print(f"  resumed session: {sessions[idx][0]}")
+                    return msgs
+                print("  (session file corrupt, skipping)")
+        except (ValueError, IndexError):
+            print("  enter a number or 'n'")
 
 
 def detect_model():
@@ -176,18 +299,9 @@ def tool_shell(command):
         return json.dumps({"error": str(e)})
 
 
-TOOL_MAP = {
-    "read_file": tool_read_file,
-    "write_file": tool_write_file,
-    "patch": tool_patch,
-    "shell": tool_shell,
-    "browser": tool_browser,
-}
-
-
 # ── browser-harness ─────────────────────────────────────────────────────
 
-BH_WORKSPACE = os.path.expanduser("~/.hermes/bh-workspace")
+BH_WORKSPACE = os.path.expanduser("~/qwenAgent/toolbin")
 
 
 def tool_browser(code):
@@ -234,6 +348,15 @@ def tool_browser(code):
         return json.dumps({"error": "browser-harness not installed. Run: uv tool install browser-harness"})
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+TOOL_MAP = {
+    "read_file": tool_read_file,
+    "write_file": tool_write_file,
+    "patch": tool_patch,
+    "shell": tool_shell,
+    "browser": tool_browser,
+}
 
 
 # ── LLM call ───────────────────────────────────────────────────────────
@@ -317,11 +440,22 @@ def main():
     global MODEL
     MODEL = detect_model()
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Check for saved sessions on startup
+    messages = pick_session()
+    if messages is None:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        print()
+    else:
+        # If resumed session has no system prompt, prepend one
+        if not any(m.get("role") == "system" for m in messages):
+            messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
     print(f"Agent harness — model: {MODEL}")
     print(f"Endpoint: {BASE_URL}")
-    print("Type your request, or /q to quit.\n")
+    print("Commands: /q to quit+suspend, /save <name>, /list, /del <name>\n")
+
+    session_name = None
+    auto_save = False
 
     while True:
         try:
@@ -330,8 +464,40 @@ def main():
             print()
             break
 
+        # ── built-in commands ──────────────────────────────────────────
+
         if user.lower() in ("/q", "/quit", "/exit"):
+            if len(messages) > 1:
+                name = session_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_session(name, messages)
+                print(f"  saved as '{name}', bye.")
             break
+
+        if user.lower() == "/list":
+            sessions = list_sessions()
+            if not sessions:
+                print("  no saved sessions")
+            else:
+                for i, (name, ts, _) in enumerate(sessions):
+                    print(f"  [{i}] {name}  ({ts})")
+            continue
+
+        if user.lower().startswith("/del "):
+            target = user[5:].strip()
+            if os.path.isfile(session_path(target)):
+                delete_session(target)
+                print(f"  deleted '{target}'")
+            else:
+                print(f"  session '{target}' not found")
+            continue
+
+        if user.lower().startswith("/save"):
+            parts = user.split(None, 1)
+            name = parts[1].strip() if len(parts) > 1 else session_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_name = name
+            save_session(name, messages)
+            print(f"  saved as '{name}'")
+            continue
 
         messages.append({"role": "user", "content": user})
 
