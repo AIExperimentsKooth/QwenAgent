@@ -45,7 +45,7 @@ def detect_model():
     return "qwen3.8-27b-obliterated@iq4_xs"
 
 # ── system prompt ──────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an autonomous agent with access to four tools. You think, then act, then observe. You continue until the user's task is fully done.
+SYSTEM_PROMPT = """You are an autonomous agent with access to five tools. You think, then act, then observe. You continue until the user's task is fully done.
 
 ## Tools
 
@@ -60,6 +60,32 @@ Find `old_string` in the file and replace it with `new_string`. **This is the pr
 
 ### 4. shell(command)
 Run any shell command. The working directory persists between calls. Use this for creating directories, listing files, running scripts, git operations, builds, etc.
+
+### 5. browser(code)
+**Browser automation via browser-harness.** Accepts multi-line Python code that runs inside the browser-harness environment. Pre-imported helpers:
+
+  new_tab(url)      — open URL in a new tab (use this for FIRST navigation)
+  goto_url(url)     — navigate current tab
+  page_info()       — get page URL, title, tab count
+  js(expr)          — evaluate JS expression and return result
+  fill_input(selector, text)
+  click_at_xy(x, y) — click at viewport coordinates
+  wait_for_load()   — wait after navigation
+  capture_screenshot() — save a screenshot
+  cdp("Domain.method", **kwargs) — raw Chrome DevTools Protocol
+  ensure_real_tab() — recover from a stale/internal tab
+  switch_tab(index) — switch to tab by 0-based index
+
+To find elements: use cdp("Accessibility.getFullAXTree")["nodes"] for the full accessibility tree, then filter in Python. Get click coordinates with cdp("DOM.getBoxModel", backendNodeId=n).
+
+Example — navigate and read:
+browser('''
+new_tab("https://example.com")
+wait_for_load()
+print(page_info())
+''')
+
+Always wait_for_load() after navigation. After clicking, verify with a targeted js() or page_info() call. If a page is bot-protected or a direct fetch fails, escalate to the browser tool.
 
 ## Protocol
 
@@ -155,7 +181,59 @@ TOOL_MAP = {
     "write_file": tool_write_file,
     "patch": tool_patch,
     "shell": tool_shell,
+    "browser": tool_browser,
 }
+
+
+# ── browser-harness ─────────────────────────────────────────────────────
+
+BH_WORKSPACE = os.path.expanduser("~/.hermes/bh-workspace")
+
+
+def tool_browser(code):
+    """Run Python code through browser-harness CLI (CDP browser automation).
+
+    Accepts multi-line Python code using the pre-imported browser helpers:
+      new_tab(url)   — open URL in new tab
+      goto_url(url)  — navigate current tab
+      page_info()    — get page state summary
+      js(expr)       — evaluate JS expression
+      fill_input(selector, text)
+      click_at_xy(x, y)
+      wait_for_load()
+      cdp("Domain.method", **kwargs)
+      capture_screenshot()
+      ensure_real_tab()
+      ... and others
+
+    First call in a session typically starts with new_tab(url).
+    Returns stdout from browser-harness.
+    """
+    os.makedirs(BH_WORKSPACE, exist_ok=True)
+    env = os.environ.copy()
+    env["BH_AGENT_WORKSPACE"] = BH_WORKSPACE
+    try:
+        result = subprocess.run(
+            ["browser-harness"],
+            input=code,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        out = result.stdout + result.stderr
+        if len(out) > 12000:
+            out = out[:12000] + f"\n\n... (truncated, full length {len(out)} chars)"
+        return json.dumps({
+            "exit_code": result.returncode,
+            "output": out,
+        })
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "browser-harness command timed out (300s)"})
+    except FileNotFoundError:
+        return json.dumps({"error": "browser-harness not installed. Run: uv tool install browser-harness"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 # ── LLM call ───────────────────────────────────────────────────────────
