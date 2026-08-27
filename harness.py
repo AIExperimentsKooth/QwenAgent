@@ -25,6 +25,9 @@ MODEL = os.environ.get("QWEN_MODEL", None)
 API_KEY = os.environ.get("QWEN_API_KEY", "")
 MAX_TOOL_ROUNDS = 30  # safety limit
 SESSIONS_DIR = os.path.expanduser("~/qwenAgent/sessions")
+CONTEXT_LENGTH = int(os.environ.get("QWEN_CONTEXT_LENGTH", "32768"))
+COMPRESSION_MODEL = os.environ.get("QWEN_COMPRESSION_MODEL", None)
+COMPRESSION_TRIGGER = float(os.environ.get("QWEN_COMPRESSION_TRIGGER", "0.75"))
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
 
@@ -166,6 +169,98 @@ def detect_model():
     except Exception as e:
         print(f"  model detection failed ({e}), fallback to env or hardcoded")
     return "qwen3.8-27b-obliterated@iq4_xs"
+
+# ── system prompt ──────────────────────────────────────────────────────
+
+# ── compression ─────────────────────────────────────────────────────────
+
+def estimate_tokens(messages):
+    """Rough token estimate: ~4 chars per token for text."""
+    total = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            total += len(content) // 4 + 100  # overhead per message
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and "text" in part:
+                    total += len(part["text"]) // 4
+            total += 100
+    return total
+
+
+def should_compress(messages):
+    """Return True if estimated token usage exceeds the trigger threshold."""
+    if COMPRESSION_TRIGGER >= 1.0:
+        return False
+    used = estimate_tokens(messages)
+    limit = int(CONTEXT_LENGTH * COMPRESSION_TRIGGER)
+    return used > limit
+
+
+def pick_compression_model():
+    """Return the model to use for compression (user-configured or fallback)."""
+    return COMPRESSION_MODEL or MODEL
+
+
+def compress_history(messages):
+    """Compress the oldest conversation history into a summary message.
+
+    Removes all non-system messages up to the last user request, sends them
+    to the compression model, and inserts a single 'system' message with the
+    compressed summary in their place. Keeps the system prompt and the most
+    recent user+assistant exchange untouched.
+    """
+    if len(messages) < 4:
+        return messages  # nothing meaningful to compress
+
+    c_model = pick_compression_model()
+    print(f"{GREY}  compressing history ({c_model})...{RESET}", flush=True)
+
+    # Find the system prompt(s) — keep them
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    non_system = [m for m in messages if m["role"] != "system"]
+
+    if len(non_system) < 2:
+        return messages
+
+    # Keep the last user+assistant exchange (2 messages at minimum)
+    keep_count = min(4, len(non_system))
+    to_compress = non_system[:-keep_count]
+    to_keep = non_system[-keep_count:]
+
+    # Build a compression prompt from the messages to compress
+    compressed_text = ""
+    for m in to_compress:
+        role = m["role"]
+        content = m.get("content", "")
+        compressed_text += f"[{role}]\n{content}\n\n"
+
+    summary_prompt = [
+        {"role": "system", "content": "You are a conversation summarizer. Compress the following agent conversation history into a concise summary. Keep all key facts, decisions, and context needed to continue the task. Output only the summary, no preamble."},
+        {"role": "user", "content": f"Summarize this conversation history:\n\n{compressed_text}"},
+    ]
+
+    try:
+        resp = client.chat.completions.create(
+            model=c_model,
+            messages=summary_prompt,
+            temperature=0.1,
+            max_tokens=1024,
+        )
+        summary = resp.choices[0].message.content.strip()
+        print(f"{GREY}  compressed {len(to_compress)} messages -> 1 summary{RESET}")
+    except Exception as e:
+        print(f"{GREY}  compression failed ({e}), keeping history{RESET}")
+        return messages
+
+    # Rebuild: system prompts + summary + recent messages
+    result = list(system_msgs)
+    result.append({"role": "system", "content": f"[Compressed history]\n{summary}"})
+    result.extend(to_keep)
+
+    return result
+
 
 # ── system prompt ──────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an autonomous agent with access to five tools. You think, then act, then observe. You continue until the user's task is fully done.
@@ -452,7 +547,7 @@ def main():
 
     print(f"Agent harness — model: {MODEL}")
     print(f"Endpoint: {BASE_URL}")
-    print("Commands: /q to quit+suspend, /save <name>, /list, /del <name>\n")
+    print("Commands: /q to quit+suspend, /save <name>, /list, /del <name>, /compress, /config\n")
 
     session_name = None
     auto_save = False
@@ -499,6 +594,25 @@ def main():
             print(f"  saved as '{name}'")
             continue
 
+        if user.lower().startswith("/compress"):
+            before = len(messages)
+            messages = compress_history(messages)
+            after = len(messages)
+            print(f"  {GOLD}compressed: {before} -> {after} messages{RESET}")
+            continue
+
+        if user.lower().startswith("/config"):
+            used = estimate_tokens(messages)
+            limit = int(CONTEXT_LENGTH * COMPRESSION_TRIGGER)
+            print(f"  model: {MODEL}")
+            print(f"  context: {CONTEXT_LENGTH} tokens")
+            print(f"  compression model: {pick_compression_model()}")
+            print(f"  compression trigger: {int(COMPRESSION_TRIGGER*100)}% ({limit} tokens)")
+            print(f"  estimated tokens in session: {used}")
+            print(f"  messages: {len(messages)}")
+            print(f"  endpoint: {BASE_URL}")
+            continue
+
         messages.append({"role": "user", "content": user})
 
         for _round in range(1, MAX_TOOL_ROUNDS + 1):
@@ -538,6 +652,10 @@ def main():
 
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue. If the task is fully done, respond with an 'answer'. Otherwise make the next tool call."})
+
+            # Auto-compress if context threshold exceeded
+            if should_compress(messages):
+                messages = compress_history(messages)
         else:
             print("  (max rounds reached)")
             messages.append({"role": "system", "content": "You have reached the maximum number of tool rounds. If the task is complete, give your final answer. If not, state what remains."})
