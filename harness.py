@@ -7,8 +7,12 @@ System prompt instructs the agent to prefer patch over write_file."""
 
 import json
 import os
+import queue
+import select
+import signal
 import subprocess
 import sys
+import threading
 import urllib.request
 from datetime import datetime
 from openai import OpenAI
@@ -30,6 +34,39 @@ COMPRESSION_MODEL = os.environ.get("QWEN_COMPRESSION_MODEL", None)
 COMPRESSION_TRIGGER = float(os.environ.get("QWEN_COMPRESSION_TRIGGER", "0.75"))
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
+
+
+# ── stream control (threading + signal) ─────────────────────────────────
+
+_stream_stop = threading.Event()
+_stream_active = threading.Event()
+_sigint_count = 0
+
+
+def handle_sigint(sig, frame):
+    global _sigint_count
+    _sigint_count += 1
+    if _sigint_count >= 2:
+        # Double CTRL-C: hard exit
+        sys.stderr.write("\n  (force exit)\n")
+        os._exit(1)
+    if _stream_active.is_set():
+        _stream_stop.set()
+        sys.stderr.write(f"\n{GREY}  (cancelling stream...){RESET}\n")
+    else:
+        sys.stderr.write("\n  use /q to save and quit\n")
+
+
+signal.signal(signal.SIGINT, handle_sigint)
+
+
+def save_and_exit(messages, name):
+    """Save session and exit cleanly."""
+    if len(messages) > 1:
+        n = name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_session(n, messages)
+        print(f"  saved as '{n}', bye.")
+    os._exit(0)
 
 
 # ── session persistence ─────────────────────────────────────────────────
@@ -457,47 +494,72 @@ TOOL_MAP = {
 # ── LLM call ───────────────────────────────────────────────────────────
 
 def llm_chat(messages, label=""):
-    """Stream model output to terminal, then clear it and return the full text."""
+    """Stream model output to terminal. Returns (text, cancelled)."""
     import shutil
     cols = shutil.get_terminal_size().columns
 
     header = f"  {label}" if label else ""
-    print(header)
+    if not _stream_stop.is_set():
+        print(header)
 
-    stream = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=0.1,
-        max_tokens=2048,
-        stream=True,
-    )
+    _stream_stop.clear()
+    _stream_active.set()
 
-    buffer = ""
-    for chunk in stream:
-        token = chunk.choices[0].delta.content or ""
-        buffer += token
-        print(f"{GREY}{token}{RESET}", end="", flush=True)
+    try:
+        stream = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=2048,
+            stream=True,
+        )
+    except Exception as e:
+        _stream_active.clear()
+        return f"  error: {e}", False
 
-    if not buffer.endswith("\n"):
-        print()  # land on a clean line
+    parts = []
+    try:
+        for chunk in stream:
+            if _stream_stop.is_set():
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                break
+            token = chunk.choices[0].delta.content or ""
+            parts.append(token)
+            sys.stdout.write(f"{GREY}{token}{RESET}")
+            sys.stdout.flush()
+    except Exception as e:
+        _stream_active.clear()
+        return f"  error: {e}", False
 
-    # Calculate how many terminal rows the streaming output consumed
-    def terminal_rows(text):
-        rows = 0
-        for line in text.split("\n"):
-            rows += max(1, (len(line) + cols - 1) // cols)
-        return rows
+    _stream_active.clear()
+    cancelled = _stream_stop.is_set()
 
-    rows_to_clear = 1 + terminal_rows(buffer)  # header + content
+    text = "".join(parts)
+    if text and not text.endswith("\n"):
+        print()
 
-    # Move up and clear each row
-    for _ in range(rows_to_clear):
-        sys.stdout.write("\033[2K")   # clear entire line
-        sys.stdout.write("\033[A")    # cursor up
-    sys.stdout.write("\033[2K")       # clear the row cursor is now on
-    sys.stdout.flush()
+    if not cancelled:
+        # Completed normally — clear the streaming output
+        def terminal_rows(t):
+            rows = 0
+            for line in t.split("\n"):
+                rows += max(1, (len(line) + cols - 1) // cols)
+            return rows
 
-    return buffer.strip()
+        rows = 1 + terminal_rows(text)
+        for _ in range(rows):
+            sys.stdout.write("\033[2K\033[A")
+        sys.stdout.write("\033[2K")
+        sys.stdout.flush()
+    else:
+        # Cancelled — leave partial output visible
+        sys.stdout.write(f"{GREY}  (cancelled){RESET}\n")
+        sys.stdout.flush()
+
+    return text.strip(), cancelled
 
 
 # ── parse agent response ────────────────────────────────────────────────
@@ -541,7 +603,6 @@ def main():
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         print()
     else:
-        # If resumed session has no system prompt, prepend one
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
 
@@ -549,74 +610,150 @@ def main():
     print(f"Endpoint: {BASE_URL}")
     print("Commands: /q to quit+suspend, /save <name>, /list, /del <name>, /compress, /config\n")
 
-    session_name = None
-    auto_save = False
+    # List-wrapped so nested handle_cmd can rebind it
+    session_name = [None]
 
-    while True:
-        try:
-            user = input(">> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
+    def handle_cmd(cmd):
+        """Process a /command. Returns 'exit', 'continue', or None (not a command)."""
+        c = cmd.lower()
 
-        # ── built-in commands ──────────────────────────────────────────
-
-        if user.lower() in ("/q", "/quit", "/exit"):
+        if c in ("/q", "/quit", "/exit"):
             if len(messages) > 1:
-                name = session_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+                name = session_name[0] or datetime.now().strftime("%Y%m%d_%H%M%S")
                 save_session(name, messages)
                 print(f"  saved as '{name}', bye.")
-            break
+            return "exit"
 
-        if user.lower() == "/list":
-            sessions = list_sessions()
-            if not sessions:
+        if c == "/list":
+            s = list_sessions()
+            if not s:
                 print("  no saved sessions")
             else:
-                for i, (name, ts, _) in enumerate(sessions):
-                    print(f"  [{i}] {name}  ({ts})")
-            continue
+                for i, (nm, ts, _) in enumerate(s):
+                    print(f"  [{i}] {nm}  ({ts})")
+            return "continue"
 
-        if user.lower().startswith("/del "):
-            target = user[5:].strip()
+        if c.startswith("/del "):
+            target = cmd[5:].strip()
             if os.path.isfile(session_path(target)):
                 delete_session(target)
                 print(f"  deleted '{target}'")
             else:
                 print(f"  session '{target}' not found")
-            continue
+            return "continue"
 
-        if user.lower().startswith("/save"):
-            parts = user.split(None, 1)
-            name = parts[1].strip() if len(parts) > 1 else session_name or datetime.now().strftime("%Y%m%d_%H%M%S")
-            session_name = name
+        if c.startswith("/save"):
+            parts = cmd.split(None, 1)
+            name = parts[1].strip() if len(parts) > 1 else session_name[0] or datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_name[0] = name
             save_session(name, messages)
             print(f"  saved as '{name}'")
-            continue
+            return "continue"
 
-        if user.lower().startswith("/compress"):
+        if c.startswith("/compress"):
             before = len(messages)
-            messages = compress_history(messages)
+            new_msgs = compress_history(messages)
+            messages.clear()
+            messages.extend(new_msgs)
             after = len(messages)
             print(f"  {GOLD}compressed: {before} -> {after} messages{RESET}")
-            continue
+            return "continue"
 
-        if user.lower().startswith("/config"):
+        if c.startswith("/config"):
             used = estimate_tokens(messages)
             limit = int(CONTEXT_LENGTH * COMPRESSION_TRIGGER)
             print(f"  model: {MODEL}")
             print(f"  context: {CONTEXT_LENGTH} tokens")
             print(f"  compression model: {pick_compression_model()}")
             print(f"  compression trigger: {int(COMPRESSION_TRIGGER*100)}% ({limit} tokens)")
-            print(f"  estimated tokens in session: {used}")
+            print(f"  estimated tokens: {used}")
             print(f"  messages: {len(messages)}")
             print(f"  endpoint: {BASE_URL}")
+            return "continue"
+
+        return None  # not a command
+
+    while True:
+        try:
+            user = input(">> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            if len(messages) > 1:
+                name = session_name[0] or datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_session(name, messages)
+                print(f"  saved as '{name}', bye.")
+            break
+
+        result = handle_cmd(user)
+        if result == "exit":
+            break
+        if result == "continue":
             continue
+        # None → not a command, treat as user request
 
         messages.append({"role": "user", "content": user})
 
+        # ── run agent rounds (with interruptible streaming) ────────────
+
+        round_interrupted = False
+        _stream_stop.clear()
+
         for _round in range(1, MAX_TOOL_ROUNDS + 1):
-            raw = llm_chat(messages, label=f"round {_round}")
+            if round_interrupted:
+                break
+
+            # Start streaming in a background thread
+            result_q = queue.Queue()
+
+            def stream_worker(msgs, rnd, q):
+                raw_text, was_cancelled = llm_chat(msgs, label=f"round {rnd}")
+                q.put((raw_text, was_cancelled))
+
+            t = threading.Thread(target=stream_worker, args=(messages, _round, result_q), daemon=True)
+            t.start()
+
+            # Poll for user input while the model streams
+            user_during_stream = None
+            while t.is_alive():
+                if _sigint_count > 0:
+                    _stream_stop.set()
+                    t.join(timeout=2)
+                    save_and_exit(messages, session_name[0])
+                    return  # unreachable but safe
+
+                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+                if ready:
+                    line = sys.stdin.readline().strip()
+                    # If it was just a stray newline from terminal, skip
+                    if not line and not user_during_stream:
+                        continue
+                    user_during_stream = line
+                    _stream_stop.set()
+                    t.join(timeout=2)
+                    break
+
+            # Collect the result
+            try:
+                raw, cancelled = result_q.get_nowait()
+            except queue.Empty:
+                raw, cancelled = "", False
+
+            if cancelled and user_during_stream is not None:
+                # User typed something mid-stream
+                if user_during_stream.lower().startswith("/"):
+                    # Process the command, then break back to prompt
+                    round_interrupted = True
+                    cmd_result = handle_cmd(user_during_stream)
+                    if cmd_result == "exit":
+                        return  # already saved inside handle_cmd
+                    break
+                else:
+                    # New user request — inject as a fresh user message and
+                    # let the next round continue with it
+                    messages.append({"role": "user", "content": user_during_stream})
+                    continue
+
+            # ── normal post-stream processing (unchanged) ──────────────
+
             thought, tool_name, params, answer = parse_agent_response(raw)
 
             if thought:
@@ -659,7 +796,7 @@ def main():
         else:
             print("  (max rounds reached)")
             messages.append({"role": "system", "content": "You have reached the maximum number of tool rounds. If the task is complete, give your final answer. If not, state what remains."})
-            raw = llm_chat(messages)
+            raw, _ = llm_chat(messages)
             thought, _, _, answer = parse_agent_response(raw)
             print(f"{GOLD}  final: {answer or raw[:500]}{RESET}")
 
