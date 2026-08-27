@@ -300,7 +300,7 @@ def compress_history(messages):
 
 
 # ── system prompt ──────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an autonomous agent with access to five tools. You think, then act, then observe. You continue until the user's task is fully done.
+SYSTEM_PROMPT = """You are an autonomous agent with access to six tools. You think, then act, then observe. You continue until the user's task is fully done.
 
 ## Tools
 
@@ -341,6 +341,15 @@ print(page_info())
 ''')
 
 Always wait_for_load() after navigation. After clicking, verify with a targeted js() or page_info() call. If a page is bot-protected or a direct fetch fails, escalate to the browser tool.
+
+### 6. ask_user(question, [choices])
+**Ask the user for input.** Use this when you need a decision, clarification, or information that only the user can provide.
+- `question` (required): what to ask
+- `choices` (optional): a list of 2-4 predefined options. When provided, the user can pick one or type a free-text answer.
+- If you omit `choices`, the user types a free-form response.
+- The result will be a JSON object with the user's `"response"` and, if a choice was picked, the `"choice_index"`.
+
+When in doubt about a decision, ask the user rather than guessing.
 
 ## Protocol
 
@@ -488,7 +497,53 @@ TOOL_MAP = {
     "patch": tool_patch,
     "shell": tool_shell,
     "browser": tool_browser,
+    "ask_user": None,  # handled specially in main loop — not dispatched through here
 }
+
+# ── ask_user (interactive — called from main thread) ───────────────────
+
+TOOL_ARGS = {
+    "ask_user": {
+        "question": {"type": "string", "description": "Question to ask the user"},
+        "choices": {"type": "list", "description": "Optional list of options (2-4). Omit for free-text input."},
+    },
+}
+
+
+def tool_ask_user_impl(question, choices=None):
+    """Display a question to the user and return their response.
+
+    Called synchronously from the main loop — not threaded.
+    """
+    if choices:
+        print(f"\n{GOLD}  ? {question}{RESET}")
+        for i, c in enumerate(choices):
+            print(f"    [{i}] {c}")
+        print(f"    [t] type your own answer")
+        while True:
+            try:
+                sel = input(f"{GOLD}  > {RESET}").strip()
+            except (EOFError, KeyboardInterrupt):
+                return json.dumps({"response": None, "cancelled": True})
+            if sel.lower() == "t":
+                try:
+                    free = input(f"{GOLD}  type your answer: {RESET}").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return json.dumps({"response": None, "cancelled": True})
+                return json.dumps({"response": free, "choice": sel})
+            try:
+                idx = int(sel)
+                if 0 <= idx < len(choices):
+                    return json.dumps({"response": choices[idx], "choice_index": idx})
+            except ValueError:
+                pass
+            print(f"  enter 0-{len(choices)-1}, 't' for custom, or Ctrl-C to cancel")
+    else:
+        try:
+            ans = input(f"\n{GOLD}  ? {question}{RESET}\n{GOLD}  > {RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            return json.dumps({"response": None, "cancelled": True})
+        return json.dumps({"response": ans})
 
 
 # ── LLM call ───────────────────────────────────────────────────────────
@@ -776,6 +831,17 @@ def main():
                 print(f"  unknown tool: {tool_name}")
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({"role": "user", "content": f"Tool '{tool_name}' is not available. Available tools: {list(TOOL_MAP.keys())}. Choose one."})
+                continue
+
+            # ask_user is interactive — handle from main thread
+            if tool_name == "ask_user":
+                print(f"{GREEN}  tool: ask_user({json.dumps(params)[:200]}){RESET}", flush=True)
+                result = tool_ask_user_impl(**params)
+                print(f"{GREEN}  result: {result[:500]}{RESET}", flush=True)
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue. If the task is fully done, respond with an 'answer'. Otherwise make the next tool call."})
+                if should_compress(messages):
+                    messages = compress_history(messages)
                 continue
 
             print(f"{GREEN}  tool: {tool_name}({json.dumps(params)[:200]}){RESET}", flush=True)
