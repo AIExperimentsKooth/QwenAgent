@@ -32,6 +32,7 @@ SESSIONS_DIR = os.path.expanduser("~/qwenAgent/sessions")
 CONTEXT_LENGTH = int(os.environ.get("QWEN_CONTEXT_LENGTH", "32768"))
 COMPRESSION_MODEL = os.environ.get("QWEN_COMPRESSION_MODEL", None)
 COMPRESSION_TRIGGER = float(os.environ.get("QWEN_COMPRESSION_TRIGGER", "0.75"))
+SKILLS_DIR = os.path.expanduser(os.environ.get("QWEN_SKILLS_DIR", "~/qwenAgent/skills"))
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
 
@@ -206,6 +207,33 @@ def detect_model():
     except Exception as e:
         print(f"  model detection failed ({e}), fallback to env or hardcoded")
     return "qwen3.8-27b-obliterated@iq4_xs"
+
+
+# ── skills system ───────────────────────────────────────────────────────
+
+SKILLS_CACHE = []   # list of (filename, content)
+
+
+def load_skills():
+    """Read all .md files from SKILLS_DIR and return (list, joined_text)."""
+    global SKILLS_CACHE
+    SKILLS_CACHE = []
+    os.makedirs(SKILLS_DIR, exist_ok=True)
+    names = sorted(os.listdir(SKILLS_DIR))
+    blocks = []
+    for fname in names:
+        if not fname.endswith(".md"):
+            continue
+        path = os.path.join(SKILLS_DIR, fname)
+        try:
+            with open(path) as f:
+                body = f.read().strip()
+            SKILLS_CACHE.append((fname, body))
+            blocks.append(f"<skill name=\"{fname[:-3]}\">\n{body}\n</skill>")
+        except Exception as e:
+            print(f"  {GREY}skill '{fname}' failed to load: {e}{RESET}")
+    return SKILLS_CACHE, "\n\n".join(blocks)
+
 
 # ── system prompt ──────────────────────────────────────────────────────
 
@@ -656,14 +684,28 @@ def main():
     messages = pick_session()
     if messages is None:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Load skills and append to system prompt
+        skills_list, skills_text = load_skills()
+        if skills_text:
+            messages[0]["content"] += "\n\n" + skills_text
+            print(f"  {GREY}loaded {len(skills_list)} skill(s) from {SKILLS_DIR}{RESET}")
         print()
     else:
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        # Ensure skills are loaded even on resumed session
+        skills_list, skills_text = load_skills()
+        if skills_text:
+            # Only append if not already present
+            sys_text = messages[0]["content"]
+            if "<skill" not in sys_text:
+                messages[0]["content"] += "\n\n" + skills_text
+                print(f"  {GREY}loaded {len(skills_list)} skill(s) from {SKILLS_DIR}{RESET}")
 
     print(f"Agent harness — model: {MODEL}")
     print(f"Endpoint: {BASE_URL}")
-    print("Commands: /q to quit+suspend, /save <name>, /list, /del <name>, /compress, /config\n")
+    print("Commands: /q, /save <name>, /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
+    print(f"Skills dir: {SKILLS_DIR} ({len(skills_list)} loaded)\n")
 
     # List-wrapped so nested handle_cmd can rebind it
     session_name = [None]
@@ -724,6 +766,28 @@ def main():
             print(f"  estimated tokens: {used}")
             print(f"  messages: {len(messages)}")
             print(f"  endpoint: {BASE_URL}")
+            return "continue"
+
+        if c == "/skills":
+            if not SKILLS_CACHE:
+                print("  no skills loaded")
+            else:
+                for fname, body in SKILLS_CACHE:
+                    print(f"  {GREEN}{fname}{RESET} ({len(body)} chars)")
+            return "continue"
+
+        if c == "/reload-skills":
+            skills_list, skills_text = load_skills()
+            # Rebuild system prompt with skills
+            sys_text = SYSTEM_PROMPT
+            if skills_text:
+                sys_text += "\n\n" + skills_text
+            messages[0]["content"] = sys_text
+            print(f"  {GOLD}reloaded {len(skills_list)} skill(s){RESET}")
+            return "continue"
+
+        if c == "/help":
+            print("  Commands: /q, /save <name>, /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
             return "continue"
 
         return None  # not a command
