@@ -328,7 +328,7 @@ def compress_history(messages):
 
 
 # ── system prompt ──────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an autonomous agent with access to six tools. You think, then act, then observe. You continue until the user's task is fully done.
+SYSTEM_PROMPT = """You are an autonomous agent with access to seven tools. You think, then act, then observe. You continue until the user's task is fully done.
 
 ## Tools
 
@@ -378,6 +378,14 @@ Always wait_for_load() after navigation. After clicking, verify with a targeted 
 - The result will be a JSON object with the user's `"response"` and, if a choice was picked, the `"choice_index"`.
 
 When in doubt about a decision, ask the user rather than guessing.
+
+### 7. write_skill(name, content)
+**Write a reusable skill to the skills directory and auto-load it into the system prompt.**
+- `name` — skill name (without .md). The file is saved as `skills/<name>.md`.
+- `content` — full markdown content. Include YAML frontmatter with `name:` and `description:` fields.
+- Skills persist across sessions and are injected into the system prompt on every startup.
+- Use this to save workflows, helper patterns, or site-specific instructions you discover.
+- The skill is immediately available to all subsequent rounds after writing.
 
 ## Protocol
 
@@ -526,14 +534,19 @@ TOOL_MAP = {
     "shell": tool_shell,
     "browser": tool_browser,
     "ask_user": None,  # handled specially in main loop — not dispatched through here
+    "write_skill": None,  # handled specially — reloads system prompt
 }
 
-# ── ask_user (interactive — called from main thread) ───────────────────
+# ── ask_user and write_skill (interactive — called from main thread) ───
 
 TOOL_ARGS = {
     "ask_user": {
         "question": {"type": "string", "description": "Question to ask the user"},
         "choices": {"type": "list", "description": "Optional list of options (2-4). Omit for free-text input."},
+    },
+    "write_skill": {
+        "name": {"type": "string", "description": "Skill name (without .md suffix)"},
+        "content": {"type": "string", "description": "Full markdown content of the skill file"},
     },
 }
 
@@ -572,6 +585,35 @@ def tool_ask_user_impl(question, choices=None):
         except (EOFError, KeyboardInterrupt):
             return json.dumps({"response": None, "cancelled": True})
         return json.dumps({"response": ans})
+
+
+def reload_skills_into_system(msgs):
+    """Rebuild messages[0] system content with fresh skill text."""
+    skills_list, skills_text = load_skills()
+    sys_text = SYSTEM_PROMPT
+    if skills_text:
+        sys_text += "\n\n" + skills_text
+    msgs[0]["content"] = sys_text
+    return len(skills_list)
+
+
+def tool_write_skill_impl(name, content, msgs):
+    """Write a skill file and auto-reload. Called from main thread."""
+    if not name.endswith(".md"):
+        fname = name + ".md"
+    else:
+        fname = name
+    path = os.path.join(SKILLS_DIR, fname)
+    os.makedirs(SKILLS_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(content)
+    count = reload_skills_into_system(msgs)
+    return json.dumps({
+        "path": path,
+        "bytes": len(content),
+        "skills_loaded": count,
+        "status": "ok",
+    })
 
 
 # ── LLM call ───────────────────────────────────────────────────────────
@@ -777,17 +819,13 @@ def main():
             return "continue"
 
         if c == "/reload-skills":
-            skills_list, skills_text = load_skills()
-            # Rebuild system prompt with skills
-            sys_text = SYSTEM_PROMPT
-            if skills_text:
-                sys_text += "\n\n" + skills_text
-            messages[0]["content"] = sys_text
-            print(f"  {GOLD}reloaded {len(skills_list)} skill(s){RESET}")
+            count = reload_skills_into_system(messages)
+            print(f"  {GOLD}reloaded {count} skill(s){RESET}")
             return "continue"
 
         if c == "/help":
             print("  Commands: /q, /save <name>, /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
+            print("  Tools: read_file, write_file, patch, shell, browser, ask_user, write_skill")
             return "continue"
 
         return None  # not a command
@@ -901,6 +939,17 @@ def main():
             if tool_name == "ask_user":
                 print(f"{GREEN}  tool: ask_user({json.dumps(params)[:200]}){RESET}", flush=True)
                 result = tool_ask_user_impl(**params)
+                print(f"{GREEN}  result: {result[:500]}{RESET}", flush=True)
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue. If the task is fully done, respond with an 'answer'. Otherwise make the next tool call."})
+                if should_compress(messages):
+                    messages = compress_history(messages)
+                continue
+
+            # write_skill — writes a .md file and reloads into system prompt
+            if tool_name == "write_skill":
+                print(f"{GREEN}  tool: write_skill({json.dumps(params)[:200]}){RESET}", flush=True)
+                result = tool_write_skill_impl(**params, msgs=messages)
                 print(f"{GREEN}  result: {result[:500]}{RESET}", flush=True)
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue. If the task is fully done, respond with an 'answer'. Otherwise make the next tool call."})
