@@ -1090,7 +1090,7 @@ def main():
             if thought:
                 print(f"{GREY}  thought: {thought[:300]}{RESET}")
 
-            if answer is not None:
+            if answer is not None and isinstance(answer, str):
                 print(f"\n{GOLD}  answer: {answer}{RESET}")
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({"role": "user", "content": "If the task is complete, say so in your answer. If more work remains, continue with another tool call."})
