@@ -723,8 +723,12 @@ def parse_agent_response(text):
         thought = obj.get("thought", "")
         if "answer" in obj:
             return thought, None, None, str(obj["answer"])
-        if "tool" in obj and "params" in obj:
-            return thought, obj["tool"], obj["params"], None
+        if "tool" in obj:
+            params = obj.get("params")
+            if params is None:
+                # Model's chat template outputs flat keys, not nested params
+                params = {k: v for k, v in obj.items() if k not in ("thought", "tool")}
+            return thought, obj["tool"], params, None
     except json.JSONDecodeError:
         pass
 
@@ -737,8 +741,11 @@ def parse_agent_response(text):
             thought = obj.get("thought", "")
             if "answer" in obj:
                 return thought, None, None, str(obj["answer"])
-            if "tool" in obj and "params" in obj:
-                return thought, obj["tool"], obj["params"], None
+            if "tool" in obj:
+                params = obj.get("params")
+                if params is None:
+                    params = {k: v for k, v in obj.items() if k not in ("thought", "tool")}
+                return thought, obj["tool"], params, None
         except json.JSONDecodeError:
             continue
 
@@ -774,8 +781,11 @@ def parse_agent_response(text):
             thought = obj.get("thought", "")
             if "answer" in obj:
                 return thought, None, None, str(obj["answer"])
-            if "tool" in obj and "params" in obj:
-                return thought, obj["tool"], obj["params"], None
+            if "tool" in obj:
+                params = obj.get("params")
+                if params is None:
+                    params = {k: v for k, v in obj.items() if k not in ("thought", "tool")}
+                return thought, obj["tool"], params, None
         except json.JSONDecodeError:
             pass
 
@@ -995,7 +1005,7 @@ def main():
                 err = answer or {"error": "Agent response format unrecognised"}
                 print(f"  parse error: {err}")
                 messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": "Your response was not parseable. Use JSON with exactly {\"thought\": \"...\", \"tool\": \"TOOL\", \"params\": {...}} or {\"thought\": \"...\", \"answer\": \"...\"}. No XML, no markdown fences, no extra top-level keys. Try again."})
+                messages.append({"role": "user", "content": "Your response was not parseable. Try again."})
                 continue
 
             if tool_name not in TOOL_MAP:
