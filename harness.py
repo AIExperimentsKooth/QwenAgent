@@ -870,7 +870,7 @@ def parse_agent_response(text):
 # ── main loop ──────────────────────────────────────────────────────────
 
 def main():
-    global MODEL
+    global MODEL, _sigint_count
     MODEL = detect_model()
 
     # Check for saved sessions on startup
