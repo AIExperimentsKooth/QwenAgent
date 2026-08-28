@@ -211,16 +211,36 @@ def detect_model():
 
 # ── skills system ───────────────────────────────────────────────────────
 
-SKILLS_CACHE = []   # list of (filename, content)
+SKILLS_CACHE = []   # list of (name, description, content)
+
+
+def extract_description(body):
+    """Extract description from YAML frontmatter, or use first line."""
+    body = body.strip()
+    if body.startswith("---"):
+        end = body.find("---", 3)
+        if end > 0:
+            front = body[3:end].strip()
+            for line in front.split("\n"):
+                if line.startswith("description:"):
+                    val = line[len("description:"):].strip().strip('"').strip("'")
+                    return val
+    # Fallback: first non-empty line
+    first = [l.strip() for l in body.split("\n") if l.strip()]
+    return first[0][:120] if first else "(no description)"
 
 
 def load_skills():
-    """Read all .md files from SKILLS_DIR and return (list, joined_text)."""
+    """Read all .md files from SKILLS_DIR.
+
+    Returns (list_of_tuples, summary_text) where summary_text is
+    a compact listing of skill names + descriptions only (no full content).
+    """
     global SKILLS_CACHE
     SKILLS_CACHE = []
     os.makedirs(SKILLS_DIR, exist_ok=True)
     names = sorted(os.listdir(SKILLS_DIR))
-    blocks = []
+    summary_lines = []
     for fname in names:
         if not fname.endswith(".md"):
             continue
@@ -228,11 +248,27 @@ def load_skills():
         try:
             with open(path) as f:
                 body = f.read().strip()
-            SKILLS_CACHE.append((fname, body))
-            blocks.append(f"<skill name=\"{fname[:-3]}\">\n{body}\n</skill>")
+            name = fname[:-3]
+            desc = extract_description(body)
+            SKILLS_CACHE.append((name, desc, body))
+            summary_lines.append(f"  {name}: {desc}")
         except Exception as e:
             print(f"  {GREY}skill '{fname}' failed to load: {e}{RESET}")
-    return SKILLS_CACHE, "\n\n".join(blocks)
+
+    if summary_lines:
+        summary = "## Available Skills\n" + "\n".join(summary_lines)
+        summary += "\n\nUse `load_skill(name)` to load a skill's full content into the conversation."
+    else:
+        summary = ""
+    return SKILLS_CACHE, summary
+
+
+def get_skill_content(name):
+    """Return the full content of a skill by name, or None."""
+    for n, desc, body in SKILLS_CACHE:
+        if n == name or n == name + ".md":
+            return body
+    return None
 
 
 # ── system prompt ──────────────────────────────────────────────────────
@@ -344,7 +380,7 @@ def compress_history(messages):
 
 
 # ── system prompt ──────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an autonomous agent with access to seven tools. You think, then act, then observe. You continue until the user's task is fully done.
+SYSTEM_PROMPT = """You are an autonomous agent with access to eight tools. You think, then act, then observe. You continue until the user's task is fully done.
 
 ## Tools
 
@@ -396,12 +432,18 @@ Always wait_for_load() after navigation. After clicking, verify with a targeted 
 When in doubt about a decision, ask the user rather than guessing.
 
 ### 7. write_skill(name, content)
-**Write a reusable skill to the skills directory and auto-load it into the system prompt.**
+**Write a reusable skill to the skills directory and register it as available.**
 - `name` — skill name (without .md). The file is saved as `skills/<name>.md`.
 - `content` — full markdown content. Include YAML frontmatter with `name:` and `description:` fields.
-- Skills persist across sessions and are injected into the system prompt on every startup.
+- The skill's name and description appear in the `## Available Skills` section of your system prompt.
+- The full content is NOT loaded until you or the agent calls `load_skill(name)`.
 - Use this to save workflows, helper patterns, or site-specific instructions you discover.
-- The skill is immediately available to all subsequent rounds after writing.
+
+### 8. load_skill(name)
+**Load a skill's full content into the conversation.**
+- `name` — skill name (without .md) from the Available Skills list.
+- The full skill content is injected as a user message so the agent can follow it.
+- Only load skills you actually need for the current task — this saves context space.
 
 ## Protocol
 
@@ -553,9 +595,10 @@ TOOL_MAP = {
     "browser": tool_browser,
     "ask_user": None,  # handled specially in main loop — not dispatched through here
     "write_skill": None,  # handled specially — reloads system prompt
+    "load_skill": None,  # handled specially — injects skill content into chat
 }
 
-# ── ask_user and write_skill (interactive — called from main thread) ───
+# ── ask_user, write_skill, and load_skill (called from main thread) ───
 
 TOOL_ARGS = {
     "ask_user": {
@@ -565,6 +608,9 @@ TOOL_ARGS = {
     "write_skill": {
         "name": {"type": "string", "description": "Skill name (without .md suffix)"},
         "content": {"type": "string", "description": "Full markdown content of the skill file"},
+    },
+    "load_skill": {
+        "name": {"type": "string", "description": "Skill name to load (without .md)"},
     },
 }
 
@@ -606,12 +652,18 @@ def tool_ask_user_impl(question, choices=None):
 
 
 def reload_skills_into_system(msgs):
-    """Rebuild messages[0] system content with fresh skill text."""
-    skills_list, skills_text = load_skills()
+    """Rebuild messages[0] system content with fresh skill summary (not full content)."""
+    skills_list, skills_summary = load_skills()
     sys_text = SYSTEM_PROMPT
-    if skills_text:
-        sys_text += "\n\n" + skills_text
-    msgs[0]["content"] = sys_text
+    if skills_summary:
+        sys_text += "\n\n" + skills_summary
+    # Preserve any already-injected skill content (kept in the conversation
+    # as user messages by load_skill) — but strip old skill-summary block
+    # from previous reloads by rebuilding from a clean base.
+    existing = msgs[0]["content"]
+    # Remove an old "## Available Skills" section if present
+    base = existing.split("\n## Available Skills")[0].rstrip()
+    msgs[0]["content"] = base + ("\n\n" + skills_summary if skills_summary else "")
     return len(skills_list)
 
 
@@ -630,6 +682,25 @@ def tool_write_skill_impl(name, content, msgs):
         "path": path,
         "bytes": len(content),
         "skills_loaded": count,
+        "status": "ok",
+    })
+
+
+def tool_load_skill_impl(name, msgs):
+    """Load a skill's full content into the conversation as a user message.
+
+    The skill summary stays in the system prompt; full content is injected
+    on demand so the context window isn't flooded with every skill.
+    """
+    body = get_skill_content(name)
+    if body is None:
+        return json.dumps({"error": f"Skill '{name}' not found. Available: {[n for n,_,_ in SKILLS_CACHE]}"})
+    # Inject skill content as a user message so the agent sees it
+    msgs.append({"role": "user", "content": f"[Skill loaded: {name}]\n{body}"})
+    return json.dumps({
+        "skill": name,
+        "bytes": len(body),
+        "injected": True,
         "status": "ok",
     })
 
@@ -805,22 +876,21 @@ def main():
     messages = pick_session()
     if messages is None:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        # Load skills and append to system prompt
-        skills_list, skills_text = load_skills()
-        if skills_text:
-            messages[0]["content"] += "\n\n" + skills_text
+        # Load skills — only summary goes into system prompt
+        skills_list, skills_summary = load_skills()
+        if skills_summary:
+            messages[0]["content"] += "\n\n" + skills_summary
             print(f"  {GREY}loaded {len(skills_list)} skill(s) from {SKILLS_DIR}{RESET}")
         print()
     else:
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-        # Ensure skills are loaded even on resumed session
-        skills_list, skills_text = load_skills()
-        if skills_text:
-            # Only append if not already present
+        # Ensure skills summary is loaded even on resumed session
+        skills_list, skills_summary = load_skills()
+        if skills_summary:
             sys_text = messages[0]["content"]
-            if "<skill" not in sys_text:
-                messages[0]["content"] += "\n\n" + skills_text
+            if "Available Skills" not in sys_text:
+                messages[0]["content"] += "\n\n" + skills_summary
                 print(f"  {GREY}loaded {len(skills_list)} skill(s) from {SKILLS_DIR}{RESET}")
 
     print(f"Agent harness — model: {MODEL}")
@@ -893,8 +963,26 @@ def main():
             if not SKILLS_CACHE:
                 print("  no skills loaded")
             else:
-                for fname, body in SKILLS_CACHE:
-                    print(f"  {GREEN}{fname}{RESET} ({len(body)} chars)")
+                print(f"  Available skills ({len(SKILLS_CACHE)}):")
+                for i, (name, desc, _) in enumerate(SKILLS_CACHE):
+                    print(f"  [{i}] {GREEN}{name}{RESET}: {desc[:100]}")
+                print(f"  [n] Cancel")
+                try:
+                    sel = input("  Inject a skill [n]: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return "continue"
+                if sel.lower() in ("", "n"):
+                    return "continue"
+                try:
+                    idx = int(sel)
+                    if 0 <= idx < len(SKILLS_CACHE):
+                        name = SKILLS_CACHE[idx][0]
+                        body = get_skill_content(name)
+                        if body:
+                            messages.append({"role": "user", "content": f"[Skill loaded: {name}]\n{body}"})
+                            print(f"  {GOLD}injected skill: {name}{RESET}")
+                except (ValueError, IndexError):
+                    pass
             return "continue"
 
         if c == "/reload-skills":
@@ -904,7 +992,7 @@ def main():
 
         if c == "/help":
             print("  Commands: /q, /save <name>, /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
-            print("  Tools: read_file, write_file, patch, shell, browser, ask_user, write_skill")
+            print("  Tools: read_file, write_file, patch, shell, browser, ask_user, write_skill, load_skill")
             return "continue"
 
         return None  # not a command
@@ -1034,6 +1122,15 @@ def main():
                 messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue. If the task is fully done, respond with an 'answer'. Otherwise make the next tool call."})
                 if should_compress(messages):
                     messages = compress_history(messages)
+                continue
+
+            # load_skill — injects full skill content into the conversation
+            if tool_name == "load_skill":
+                print(f"{GREEN}  tool: load_skill({json.dumps(params)[:200]}){RESET}", flush=True)
+                result = tool_load_skill_impl(**params, msgs=messages)
+                print(f"{GREEN}  result: {result[:500]}{RESET}", flush=True)
+                messages.append({"role": "assistant", "content": raw})
+                messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue. If the task is fully done, respond with an 'answer'. Otherwise make the next tool call."})
                 continue
 
             print(f"{GREEN}  tool: {tool_name}({json.dumps(params)[:200]}){RESET}", flush=True)
