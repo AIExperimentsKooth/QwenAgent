@@ -723,8 +723,12 @@ def parse_agent_response(text):
         thought = obj.get("thought", "")
         if "answer" in obj:
             return thought, None, None, str(obj["answer"])
-        if "tool" in obj and "params" in obj:
-            return thought, obj["tool"], obj["params"], None
+        if "tool" in obj:
+            params = obj.get("params")
+            if params is None:
+                # Model put params as top-level keys instead of nested
+                params = {k: v for k, v in obj.items() if k not in ("thought", "tool")}
+            return thought, obj["tool"], params, None
     except json.JSONDecodeError:
         pass
 
@@ -737,8 +741,11 @@ def parse_agent_response(text):
             thought = obj.get("thought", "")
             if "answer" in obj:
                 return thought, None, None, str(obj["answer"])
-            if "tool" in obj and "params" in obj:
-                return thought, obj["tool"], obj["params"], None
+            if "tool" in obj:
+                params = obj.get("params")
+                if params is None:
+                    params = {k: v for k, v in obj.items() if k not in ("thought", "tool")}
+                return thought, obj["tool"], params, None
         except json.JSONDecodeError:
             continue
 
@@ -774,8 +781,11 @@ def parse_agent_response(text):
             thought = obj.get("thought", "")
             if "answer" in obj:
                 return thought, None, None, str(obj["answer"])
-            if "tool" in obj and "params" in obj:
-                return thought, obj["tool"], obj["params"], None
+            if "tool" in obj:
+                params = obj.get("params")
+                if params is None:
+                    params = {k: v for k, v in obj.items() if k not in ("thought", "tool")}
+                return thought, obj["tool"], params, None
         except json.JSONDecodeError:
             pass
 
