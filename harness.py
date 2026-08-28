@@ -389,28 +389,38 @@ When in doubt about a decision, ask the user rather than guessing.
 
 ## Protocol
 
-Your response must be valid JSON in one of two shapes:
+Your response must be a tool call or a final answer. Use one of these formats:
 
-### Tool-call shape
+### Option A: JSON (recommended)
 ```json
 {
-  "thought": "I need to read the config file first to understand the structure.",
+  "thought": "I need to read the config file first.",
   "tool": "read_file",
   "params": {"path": "/path/to/file"}
 }
 ```
-
-### Final-answer shape
+Or for a final answer:
 ```json
 {
-  "thought": "The task is done — I verified the file exists and the config is correct.",
-  "answer": "All done. The config was updated and tests pass."
+  "thought": "The task is done.",
+  "answer": "All done. The config was updated."
 }
 ```
 
+### Option B: XML tool_call (also accepted)
+```
+<tool_call>
+<function=TOOL_NAME>
+<parameter=KEY>value</parameter>
+</function>
+</tool_call>
+```
+
+You may include natural language before the XML block; that text becomes the thought.
+
 Rules:
 - One tool call at a time. Wait for the result before the next.
-- Always explain *why* you are calling the tool (in "thought").
+- Always explain *why* you are calling the tool (in "thought" or preceding prose).
 - When the task is complete, return an "answer" — never a tool call.
 - Prefer patch over write_file for editing existing files.
 - If a tool errors, analyse the message and try a different approach.
@@ -690,30 +700,78 @@ def llm_chat(messages, label=""):
 # ── parse agent response ────────────────────────────────────────────────
 
 def parse_agent_response(text):
-    """Return (thought, tool_name, params, answer) — exactly one of tool/answer set."""
-    # Try to find and parse a JSON block
-    # First, try the whole text
+    """Return (thought, tool_name, params, answer) — exactly one of tool/answer set.
+
+    Supports two formats:
+    1. JSON: {"thought": "...", "tool": "...", "params": {...}}
+    2. XML: <tool_call><function=NAME><parameter=KEY>VAL</parameter></function></tool_call>
+    """
+    # ── Strategy 1: pure JSON ──────────────────────────────────────────
     try:
         obj = json.loads(text)
+        thought = obj.get("thought", "")
+        if "answer" in obj:
+            return thought, None, None, str(obj["answer"])
+        if "tool" in obj and "params" in obj:
+            return thought, obj["tool"], obj["params"], None
     except json.JSONDecodeError:
-        # Try to extract a JSON block from markdown fences or braces
-        import re
-        matches = re.findall(r"\{[^{}]*\}", text, re.DOTALL)
-        for m in reversed(matches):  # try largest first
-            try:
-                obj = json.loads(m)
-                break
-            except json.JSONDecodeError:
-                continue
-        else:
-            return None, None, None, {"error": f"Could not parse JSON from agent response", "raw": text[:500]}
+        pass
 
-    thought = obj.get("thought", "")
-    if "answer" in obj:
-        return thought, None, None, str(obj["answer"])
-    if "tool" in obj and "params" in obj:
-        return thought, obj["tool"], obj["params"], None
-    return None, None, None, {"error": f"Response has neither 'answer' nor 'tool'/'params'", "raw": text[:500]}
+    # ── Strategy 2: JSON block extracted from prose ────────────────────
+    import re
+    matches = re.findall(r"\{[^{}]*\}", text, re.DOTALL)
+    for m in reversed(matches):
+        try:
+            obj = json.loads(m)
+            thought = obj.get("thought", "")
+            if "answer" in obj:
+                return thought, None, None, str(obj["answer"])
+            if "tool" in obj and "params" in obj:
+                return thought, obj["tool"], obj["params"], None
+        except json.JSONDecodeError:
+            continue
+
+    # ── Strategy 3: XML tool_call format ──────────────────────────────
+    # Format: <tool_call><function=NAME><parameter=KEY>VAL</parameter></function></tool_call>
+    tc_match = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+    if tc_match:
+        inner = tc_match.group(1)
+        # Extract function (after <function= or <function>)
+        func_match = re.search(r"<function[=>]\s*(\S+?)\s*>", inner)
+        if func_match:
+            tool_name = func_match.group(1).strip()
+            # Extract all parameters
+            params = {}
+            for p_match in re.finditer(
+                r"<parameter[=>]\s*(\S+?)\s*>(.*?)</parameter>", inner, re.DOTALL
+            ):
+                key = p_match.group(1).strip()
+                val = p_match.group(2).strip()
+                params[key] = val
+            # Everything before <tool_call> is the thought
+            thought = text[:tc_match.start()].strip()
+            return thought, tool_name, params, None
+
+    # ── Strategy 4: markdown-fenced JSON ───────────────────────────────
+    # ```json { ... } ```
+    fence_match = re.search(
+        r"```(?:json)?\s*\n?(\{.*?\})\n?\s*```", text, re.DOTALL
+    )
+    if fence_match:
+        try:
+            obj = json.loads(fence_match.group(1))
+            thought = obj.get("thought", "")
+            if "answer" in obj:
+                return thought, None, None, str(obj["answer"])
+            if "tool" in obj and "params" in obj:
+                return thought, obj["tool"], obj["params"], None
+        except json.JSONDecodeError:
+            pass
+
+    return None, None, None, {
+        "error": "Could not parse agent response as JSON or XML tool_call",
+        "raw": text[:500],
+    }
 
 
 # ── main loop ──────────────────────────────────────────────────────────
@@ -926,7 +984,7 @@ def main():
                 err = answer or {"error": "Agent response format unrecognised"}
                 print(f"  parse error: {err}")
                 messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": f"Your response was not parseable. Respond with valid JSON: either {{\"thought\": \"...\", \"tool\": \"...\", \"params\": {{...}}}} or {{\"thought\": \"...\", \"answer\": \"...\"}}. Raw: {json.dumps(err)}"})
+                messages.append({"role": "user", "content": f"Your response was not parseable. Use JSON or XML format. Raw: {json.dumps(err)}"})
                 continue
 
             if tool_name not in TOOL_MAP:
