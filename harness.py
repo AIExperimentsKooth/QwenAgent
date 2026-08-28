@@ -32,7 +32,7 @@ SESSIONS_DIR = os.path.expanduser("~/qwenAgent/sessions")
 CONTEXT_LENGTH = int(os.environ.get("QWEN_CONTEXT_LENGTH", "32768"))
 COMPRESSION_MODEL = os.environ.get("QWEN_COMPRESSION_MODEL", None)
 COMPRESSION_TRIGGER = float(os.environ.get("QWEN_COMPRESSION_TRIGGER", "0.75"))
-MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "8192"))
+MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "16384"))
 SKILLS_DIR = os.path.expanduser(os.environ.get("QWEN_SKILLS_DIR", "~/qwenAgent/skills"))
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
@@ -1100,7 +1100,12 @@ def main():
                 err = answer or {"error": "Agent response format unrecognised"}
                 print(f"  parse error: {err}")
                 messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": "Your response was not parseable. Try again."})
+                # Check if the response was truncated mid-JSON (no closing brace)
+                stripped = raw.strip()
+                if stripped and not stripped.endswith("}"):
+                    messages.append({"role": "user", "content": "Your response was cut off. Continue from where you left off — finish the JSON."})
+                else:
+                    messages.append({"role": "user", "content": "Your response was not parseable. Try again."})
                 continue
 
             if tool_name not in TOOL_MAP:
