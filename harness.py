@@ -389,9 +389,9 @@ When in doubt about a decision, ask the user rather than guessing.
 
 ## Protocol
 
-Your response must be a tool call or a final answer. Use one of these formats:
+Your response must use **valid JSON** in one of these two shapes:
 
-### Option A: JSON (recommended)
+### Tool-call shape
 ```json
 {
   "thought": "I need to read the config file first.",
@@ -399,7 +399,8 @@ Your response must be a tool call or a final answer. Use one of these formats:
   "params": {"path": "/path/to/file"}
 }
 ```
-Or for a final answer:
+
+### Final-answer shape
 ```json
 {
   "thought": "The task is done.",
@@ -407,20 +408,11 @@ Or for a final answer:
 }
 ```
 
-### Option B: XML tool_call (also accepted)
-```
-<tool_call>
-<function=TOOL_NAME>
-<parameter=KEY>value</parameter>
-</function>
-</tool_call>
-```
-
-You may include natural language before the XML block; that text becomes the thought.
+Output ONLY clean JSON — do NOT wrap it in XML tags, markdown fences, or any other formatting. No `<tool_call>`, no `<function>`, no backticks. Just the JSON object on its own.
 
 Rules:
 - One tool call at a time. Wait for the result before the next.
-- Always explain *why* you are calling the tool (in "thought" or preceding prose).
+- Always explain *why* you are calling the tool (in "thought").
 - When the task is complete, return an "answer" — never a tool call.
 - Prefer patch over write_file for editing existing files.
 - If a tool errors, analyse the message and try a different approach.
