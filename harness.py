@@ -245,7 +245,7 @@ def estimate_tokens(messages):
     for m in messages:
         content = m.get("content", "")
         if isinstance(content, str):
-            total += len(content) // 4 + 100  # overhead per message
+            total += len(content) // 4 + 100
         elif isinstance(content, list):
             for part in content:
                 if isinstance(part, dict) and "text" in part:
@@ -268,42 +268,57 @@ def pick_compression_model():
     return COMPRESSION_MODEL or MODEL
 
 
-def compress_history(messages):
-    """Compress the oldest conversation history into a summary message.
+def consolidate_system_msgs(messages):
+    """Merge all system messages into one at the start.
 
-    Removes all non-system messages up to the last user request, sends them
-    to the compression model, and inserts a single 'system' message with the
-    compressed summary in their place. Keeps the system prompt and the most
-    recent user+assistant exchange untouched.
+    Many GGUF/llama.cpp backends reject multiple system messages or
+    system messages appearing after user/assistant turns. This ensures
+    exactly one system message at position 0.
     """
-    if len(messages) < 4:
-        return messages  # nothing meaningful to compress
+    sys_parts = []
+    non_sys = []
+    for m in messages:
+        if m["role"] == "system":
+            sys_parts.append(m["content"])
+        else:
+            non_sys.append(m)
+    if len(sys_parts) <= 1:
+        return messages
+    merged = "\n\n".join(sys_parts)
+    return [{"role": "system", "content": merged}] + non_sys
+
+
+def compress_history(messages):
+    """Compress the oldest conversation history into a summary.
+
+    Merges the summary into the main system prompt rather than adding
+    a separate system message (many backends enforce one system msg).
+    """
+    msgs = consolidate_system_msgs(messages)
+    if len(msgs) < 4:
+        return msgs
 
     c_model = pick_compression_model()
     print(f"{GREY}  compressing history ({c_model})...{RESET}", flush=True)
 
-    # Find the system prompt(s) — keep them
-    system_msgs = [m for m in messages if m["role"] == "system"]
-    non_system = [m for m in messages if m["role"] != "system"]
+    system_msg = msgs[0] if msgs[0]["role"] == "system" else None
+    non_system = [m for m in msgs if m["role"] != "system"]
 
     if len(non_system) < 2:
-        return messages
+        return msgs
 
-    # Keep the last user+assistant exchange (2 messages at minimum)
     keep_count = min(4, len(non_system))
     to_compress = non_system[:-keep_count]
     to_keep = non_system[-keep_count:]
 
-    # Build a compression prompt from the messages to compress
     compressed_text = ""
     for m in to_compress:
-        role = m["role"]
-        content = m.get("content", "")
-        compressed_text += f"[{role}]\n{content}\n\n"
+        compressed_text += f"[{m['role']}]\n{m.get('content', '')}\n\n"
 
+    # Use a single user message — no system message — to avoid template
+    # issues with the compression model.
     summary_prompt = [
-        {"role": "system", "content": "You are a conversation summarizer. Compress the following agent conversation history into a concise summary. Keep all key facts, decisions, and context needed to continue the task. Output only the summary, no preamble."},
-        {"role": "user", "content": f"Summarize this conversation history:\n\n{compressed_text}"},
+        {"role": "user", "content": f"Summarize this conversation history concisely. Keep all key facts, decisions, and context needed to continue the task. Output only the summary, no preamble.\n\n{compressed_text}"},
     ]
 
     try:
@@ -317,13 +332,14 @@ def compress_history(messages):
         print(f"{GREY}  compressed {len(to_compress)} messages -> 1 summary{RESET}")
     except Exception as e:
         print(f"{GREY}  compression failed ({e}), keeping history{RESET}")
-        return messages
+        return msgs
 
-    # Rebuild: system prompts + summary + recent messages
-    result = list(system_msgs)
-    result.append({"role": "system", "content": f"[Compressed history]\n{summary}"})
+    # Merge summary into the existing system prompt
+    base = system_msg["content"] if system_msg else ""
+    new_sys = f"{base}\n\n[Compressed history]\n{summary}" if base else f"[Compressed history]\n{summary}"
+
+    result = [{"role": "system", "content": new_sys}]
     result.extend(to_keep)
-
     return result
 
 
@@ -633,9 +649,12 @@ def llm_chat(messages, label=""):
     _stream_active.set()
 
     try:
+        # Consolidate system messages — many GGUF backends reject
+        # multiple system messages or mid-turn system messages.
+        safe_msgs = consolidate_system_msgs(messages)
         stream = client.chat.completions.create(
             model=MODEL,
-            messages=messages,
+            messages=safe_msgs,
             temperature=0.1,
             max_tokens=2048,
             stream=True,
