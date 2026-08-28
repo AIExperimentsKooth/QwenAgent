@@ -1042,8 +1042,14 @@ def main():
                 if _sigint_count > 0:
                     _stream_stop.set()
                     t.join(timeout=2)
-                    save_and_exit(messages, session_name[0])
-                    return  # unreachable but safe
+                    # Save and return to prompt instead of exiting
+                    if len(messages) > 1:
+                        name = session_name[0] or datetime.now().strftime("%Y%m%d_%H%M%S")
+                        save_session(name, messages)
+                        print(f"  saved as '{name}', back to prompt.")
+                    _sigint_count = 0
+                    round_interrupted = True
+                    break
 
                 ready, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if ready:
