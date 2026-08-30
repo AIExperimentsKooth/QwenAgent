@@ -21,6 +21,7 @@ from openai import OpenAI
 GREY = "\033[90m"
 GREEN = "\033[32m"
 GOLD = "\033[33m"
+RED = "\033[31m"
 RESET = "\033[0m"
 
 # ── config ─────────────────────────────────────────────────────────────
@@ -34,6 +35,7 @@ COMPRESSION_MODEL = os.environ.get("QWEN_COMPRESSION_MODEL", None)
 COMPRESSION_TRIGGER = float(os.environ.get("QWEN_COMPRESSION_TRIGGER", "0.75"))
 MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "16384"))
 SKILLS_DIR = os.path.expanduser(os.environ.get("QWEN_SKILLS_DIR", "~/qwenAgent/skills"))
+WORKSPACE_DIR = os.environ.get("QWEN_WORKSPACE_DIR", "/workspace")
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
 
@@ -300,6 +302,25 @@ def should_compress(messages):
     return used > limit
 
 
+def context_display(messages):
+    """Return a short human-readable estimate of current context usage.
+
+    Good-faith estimate based on estimate_tokens() (roughly 4 chars/token).
+    Shown to the user before each input prompt so they can see how full
+    the context window is.
+    """
+    used = estimate_tokens(messages)
+    pct = (used / CONTEXT_LENGTH * 100) if CONTEXT_LENGTH else 0
+    # Color the percentage: green < 50%, gold < 75%, red >= 75%
+    if pct >= 75:
+        color = "\033[31m"  # red
+    elif pct >= 50:
+        color = GOLD
+    else:
+        color = GREEN
+    return f"{GREY}  [context ~{used:,}/{CONTEXT_LENGTH:,} tokens ({color}{pct:.0f}%{RESET}{GREY})]{RESET}"
+
+
 def pick_compression_model():
     """Return the model to use for compression (user-configured or fallback)."""
     return COMPRESSION_MODEL or MODEL
@@ -348,6 +369,10 @@ def compress_history(messages):
     to_compress = non_system[:-keep_count]
     to_keep = non_system[-keep_count:]
 
+    # Nothing to compress — return as-is
+    if not to_compress:
+        return msgs
+
     compressed_text = ""
     for m in to_compress:
         compressed_text += f"[{m['role']}]\n{m.get('content', '')}\n\n"
@@ -371,8 +396,13 @@ def compress_history(messages):
         print(f"{GREY}  compression failed ({e}), keeping history{RESET}")
         return msgs
 
-    # Merge summary into the existing system prompt
+    # Merge summary into the existing system prompt, replacing any
+    # previous [Compressed history] section so repeated compressions
+    # don't keep appending and growing the system prompt indefinitely.
     base = system_msg["content"] if system_msg else ""
+    # Strip any prior compressed-history block
+    if "[Compressed history]" in base:
+        base = base.split("[Compressed history]")[0].rstrip()
     new_sys = f"{base}\n\n[Compressed history]\n{summary}" if base else f"[Compressed history]\n{summary}"
 
     result = [{"role": "system", "content": new_sys}]
@@ -871,6 +901,11 @@ def parse_agent_response(text):
 
 def main():
     global MODEL, _sigint_count
+
+    # Ensure the default workspace directory exists and switch into it
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    os.chdir(WORKSPACE_DIR)
+
     MODEL = detect_model()
 
     # Check for saved sessions on startup
@@ -999,6 +1034,9 @@ def main():
         return None  # not a command
 
     while True:
+        # Display current context estimate before prompting
+        sys.stdout.write(context_display(messages))
+        sys.stdout.flush()
         try:
             user = input(">> ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1098,7 +1136,7 @@ def main():
 
             if tool_name is None or params is None:
                 err = answer or {"error": "Agent response format unrecognised"}
-                print(f"  parse error: {err}")
+                print(f"{RED}  parse error: {err}{RESET}")
                 messages.append({"role": "assistant", "content": raw})
                 # Check if the response was truncated mid-JSON (no closing brace)
                 stripped = raw.strip()
@@ -1109,7 +1147,7 @@ def main():
                 continue
 
             if tool_name not in TOOL_MAP:
-                print(f"  unknown tool: {tool_name}")
+                print(f"{RED}  unknown tool: {tool_name}{RESET}")
                 messages.append({"role": "assistant", "content": raw})
                 messages.append({"role": "user", "content": f"Tool '{tool_name}' is not available. Available tools: {list(TOOL_MAP.keys())}. Choose one."})
                 continue
@@ -1152,7 +1190,11 @@ def main():
             except Exception as e:
                 result = json.dumps({"error": str(e)})
 
-            print(f"{GREEN}  result: {result[:500]}{RESET}", flush=True)
+            # Color the result red if it contains an error
+            if '"error"' in result:
+                print(f"{RED}  result: {result[:500]}{RESET}", flush=True)
+            else:
+                print(f"{GREEN}  result: {result[:500]}{RESET}", flush=True)
 
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": f"Tool result:\n{result}\n\nContinue. If the task is fully done, respond with an 'answer'. Otherwise make the next tool call."})
