@@ -4,7 +4,15 @@
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "[boot] activating venv at $DIR/.venv"
+export PATH="${HOME}/.local/bin:${PATH}"
+
+if [[ ! -x "$DIR/.venv/bin/python" ]]; then
+  printf 'error: .venv is missing; run ./install.sh first\n' >&2
+  exit 1
+fi
+
+printf '[boot] activating venv at %s/.venv\n' "$DIR"
+# shellcheck disable=SC1091
 source "$DIR/.venv/bin/activate"
 
 echo "[boot] starting harness.py"

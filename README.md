@@ -5,7 +5,14 @@ Minimal tool-calling loop over any OpenAI-compatible endpoint. Designed for runn
 ## Quick Start
 
 ```bash
+./install.sh
 ./boot.sh
+```
+
+To update the checkout and reinstall dependencies:
+
+```bash
+./update.sh
 ```
 
 Auto-detects whatever model is loaded at `http://100.64.2.163:1234/v1` (no API key required). On startup you can resume a previous session or start fresh.
@@ -20,7 +27,7 @@ Auto-detects whatever model is loaded at `http://100.64.2.163:1234/v1` (no API k
 | `QWEN_CONTEXT_LENGTH` | `32768` | Model's max context (tokens) |
 | `QWEN_COMPRESSION_MODEL` | *(same as MODEL)* | Separate model for compression |
 | `QWEN_COMPRESSION_TRIGGER` | `0.75` | Compress when context is this % full |
-| `QWEN_SKILLS_DIR` | `~/qwenAgent/skills` | Directory for .md skill files |
+| `QWEN_SKILLS_DIR` | `skills` | Directory for .md skill files (relative to the repository) |
 
 ```bash
 QWEN_API_BASE=http://other-host:1234/v1 ./boot.sh
@@ -42,7 +49,7 @@ The agent has 7 tools at its disposal:
 
 ### Session Persistence
 
-- `/save <name>` — save current session to `~/qwenAgent/sessions/<name>.json`
+- `/save <name>` — save current session to `sessions/<name>.json`
 - `/list` — show saved sessions
 - `/del <name>` — delete a saved session
 - `/q` — auto-save and quit
@@ -62,7 +69,7 @@ When the estimated token count exceeds `CONTEXT_LENGTH × COMPRESSION_TRIGGER`, 
 
 ### Skills System
 
-Drop `.md` files into `~/qwenAgent/skills/`. They're loaded into the system prompt wrapped as `<skill>...</skill>` blocks. The agent can create its own skills with `write_skill`. Commands: `/skills` (list), `/reload-skills` (re-read from disk).
+Drop `.md` files into `skills/`. They're loaded into the system prompt wrapped as `<skill>...</skill>` blocks. The agent can create its own skills with `write_skill`. Commands: `/skills` (list), `/reload-skills` (re-read from disk).
 
 ### Colors
 

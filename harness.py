@@ -1,4 +1,4 @@
-#!/home/aiker/qwenAgent/.venv/bin/python3
+#!/usr/bin/env python3
 """Minimal tool-calling loop over an OpenAI-compatible endpoint.
 
 Auto-detects the loaded model from /v1/models at startup.
@@ -25,17 +25,26 @@ RED = "\033[31m"
 RESET = "\033[0m"
 
 # ── config ─────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def repo_path(env_name, default):
+    """Return a path relative to the repository unless explicitly overridden."""
+    value = os.environ.get(env_name) or default
+    return value if os.path.isabs(value) else os.path.join(BASE_DIR, value)
+
+
 BASE_URL = os.environ.get("QWEN_API_BASE", "http://100.64.2.163:1234/v1")
 MODEL = os.environ.get("QWEN_MODEL", None)
 API_KEY = os.environ.get("QWEN_API_KEY", "")
 MAX_TOOL_ROUNDS = 30  # safety limit
-SESSIONS_DIR = os.path.expanduser("~/qwenAgent/sessions")
+SESSIONS_DIR = repo_path("QWEN_SESSIONS_DIR", "sessions")
 CONTEXT_LENGTH = int(os.environ.get("QWEN_CONTEXT_LENGTH", "32768"))
 COMPRESSION_MODEL = os.environ.get("QWEN_COMPRESSION_MODEL", None)
 COMPRESSION_TRIGGER = float(os.environ.get("QWEN_COMPRESSION_TRIGGER", "0.75"))
 MAX_TOKENS = int(os.environ.get("QWEN_MAX_TOKENS", "16384"))
-SKILLS_DIR = os.path.expanduser(os.environ.get("QWEN_SKILLS_DIR", "~/qwenAgent/skills"))
-WORKSPACE_DIR = os.environ.get("QWEN_WORKSPACE_DIR", "/workspace")
+SKILLS_DIR = repo_path("QWEN_SKILLS_DIR", "skills")
+WORKSPACE_DIR = repo_path("QWEN_WORKSPACE_DIR", "workspace")
 
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
 
@@ -569,7 +578,7 @@ def tool_shell(command):
 
 # ── browser-harness ─────────────────────────────────────────────────────
 
-BH_WORKSPACE = os.path.expanduser("~/qwenAgent/toolbin")
+BH_WORKSPACE = repo_path("QWEN_TOOLBIN_DIR", "toolbin")
 
 
 def tool_browser(code):
