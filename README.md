@@ -87,7 +87,29 @@ Drop `.md` files into `skills/`. They're loaded into the system prompt wrapped a
 
 - Python 3.10+
 - `openai` package (installed in `.venv/`)
-- browser-harness CLI: `uv tool install --python 3.12 --upgrade --force browser-harness`
+- browser-harness CLI (installed by `./install.sh`): `uv tool install --python 3.12 --upgrade --force browser-harness`
+
+## Architecture
+
+The harness is split into small single-purpose modules in the `qwen_agent/`
+package so individual agents can work on one component at a time:
+
+| Module | Responsibility |
+|---|---|
+| `qwen_agent/config.py` | ANSI colors, repo-relative paths, env config, LLM client, model detection |
+| `qwen_agent/control.py` | Shared stream-cancellation events + SIGINT handling |
+| `qwen_agent/prompt.py` | The static system prompt |
+| `qwen_agent/sessions.py` | Session save/list/load/delete/resume |
+| `qwen_agent/skills.py` | Skill discovery, cache, content lookup |
+| `qwen_agent/context.py` | Token estimation + history compression |
+| `qwen_agent/parse.py` | Parsing raw model output into tool calls / answers |
+| `qwen_agent/tools.py` | Dispatchable tools (read/write/patch/shell/browser) |
+| `qwen_agent/interactive.py` | Main-thread tools (ask_user, write_skill, load_skill) |
+| `qwen_agent/llm.py` | Streaming LLM chat with cancellation |
+| `qwen_agent/main.py` | Interactive main loop + `/` commands |
+
+`harness.py` is a thin launcher over `qwen_agent.main`. Run smoke tests with
+`.venv/bin/python test_smoke.py`.
 
 ## Configuration
 
