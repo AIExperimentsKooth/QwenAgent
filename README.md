@@ -102,6 +102,7 @@ Windows notes:
 - `uv` must be installed first (https://docs.astral.sh/uv/); install.sh/install.bat do not install it for you.
 - `install.bat` requires Python 3.10+ on PATH.
 - The bat scripts are plain ASCII; run them from cmd. PowerShell works too: `.\install.bat`.
+- Both bat scripts `pause` before the window closes (on success and on error), so messages stay readable when launched by double-click.
 
 ## Architecture
 
