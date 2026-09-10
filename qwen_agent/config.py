@@ -12,6 +12,34 @@ import urllib.request
 from openai import OpenAI
 
 # ── ANSI colors ────────────────────────────────────────────────────────
+def _enable_windows_ansi():
+    """Enable ANSI escape processing in the Windows console (stdout + stderr).
+
+    Classic cmd.exe renders ``\033[..m`` color codes as garbage unless VT
+    processing is turned on. Windows Terminal and conemu already enable it,
+    so this is a no-op for them — and a silent no-op whenever the handles
+    are not consoles (e.g. output piped to a file).
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        for std_handle in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            h = kernel32.GetStdHandle(std_handle)
+            if not h:
+                continue
+            mode = kernel32.GetConsoleMode(h)
+            if not mode:
+                continue  # not a console (redirected) or error
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel32.SetConsoleMode(h, mode | 0x0004)
+    except Exception:
+        pass  # never break startup over console cosmetics
+
+
+_enable_windows_ansi()
+
 GREY = "\033[90m"
 GREEN = "\033[32m"
 GOLD = "\033[33m"
