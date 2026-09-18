@@ -15,6 +15,8 @@ To update the checkout and reinstall dependencies:
 ./update.sh
 ```
 
+On Windows (native cmd/PowerShell, no Git Bash needed): `update.cmd`
+
 Auto-detects whatever model is loaded at `http://100.64.2.163:1234/v1` (no API key required). On startup you can resume a previous session or start fresh.
 
 ### Environment Variables
