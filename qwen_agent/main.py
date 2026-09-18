@@ -24,21 +24,34 @@ from . import (
     skills,
     tools,
 )
-from .prompt import SYSTEM_PROMPT
+from .prompt import SYSTEM_PROMPT, system_diagnostics
 
 
 def startup_messages():
-    """Build the initial conversation, resuming a session if the user picks one."""
-    messages = sessions.pick_session()
-    if messages is None:
+    """Build the initial conversation, resuming a session if the user picks one.
+
+    Returns (messages, skills_list, session_file, session_title):
+      session_file  — the session's fixed JSON filename: the start-date stamp
+                      for a fresh session, the original file for a resumed one.
+                      Every save for this session writes here — never a new file.
+      session_title — the user-set display title (from the saved file), or None.
+    """
+    picked = sessions.pick_session()
+    if picked is None:
+        session_file = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_title = None
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # New session: report OS, uptime and available RAM to the model
+        messages[0]["content"] += "\n\n" + system_diagnostics()
         # Load skills — only summary goes into system prompt
         skills_list, skills_summary = skills.load_skills()
         if skills_summary:
             messages[0]["content"] += "\n\n" + skills_summary
             print(f"  {config.GREY}loaded {len(skills_list)} skill(s) from {config.SKILLS_DIR}{config.RESET}")
         print()
+        print(f"  {config.GREY}session file: {session_file}{config.RESET}")
     else:
+        session_file, session_title, messages = picked
         if not any(m.get("role") == "system" for m in messages):
             messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         # Ensure skills summary is loaded even on resumed session
@@ -49,11 +62,7 @@ def startup_messages():
                 messages[0]["content"] += "\n\n" + skills_summary
                 print(f"  {config.GREY}loaded {len(skills_list)} skill(s) from {config.SKILLS_DIR}{config.RESET}")
 
-    return messages, skills_list
-
-
-def default_session_name():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return messages, skills_list, session_file, session_title
 
 
 def main():
@@ -66,15 +75,18 @@ def main():
     config.MODEL = config.detect_model()
 
     # Check for saved sessions on startup
-    messages, skills_list = startup_messages()
+    messages, skills_list, session_file, session_title = startup_messages()
 
     print(f"Agent harness — model: {config.MODEL}")
     print(f"Endpoint: {config.BASE_URL}")
-    print("Commands: /q, /save <name>, /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
+    print("Commands: /q, /save [title], /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
     print(f"Skills dir: {config.SKILLS_DIR} ({len(skills_list)} loaded)\n")
 
-    # List-wrapped so nested handle_cmd can rebind it
-    session_name = [None]
+    # This session's identity: [fixed JSON file, user title]. The file is set
+    # once at session start (start-date stamp, or the resumed file) — every
+    # save writes here, never a new file. The title is mutable via /save.
+    # List-wrapped so nested handle_cmd can rebind it.
+    session = [session_file, session_title]
 
     def handle_cmd(cmd):
         """Process a /command. Returns 'exit', 'continue', or None (not a command)."""
@@ -82,9 +94,9 @@ def main():
 
         if c in ("/q", "/quit", "/exit"):
             if len(messages) > 1:
-                name = session_name[0] or default_session_name()
-                sessions.save_session(name, messages)
-                print(f"  saved as '{name}', bye.")
+                sessions.save_session(session[0], messages, title=session[1])
+                suffix = f" as '{session[1]}'" if session[1] else ""
+                print(f"  saved as '{session[0]}'{suffix}, bye.")
             return "exit"
 
         if c == "/list":
@@ -92,8 +104,8 @@ def main():
             if not s:
                 print("  no saved sessions")
             else:
-                for i, (nm, ts, _) in enumerate(s):
-                    print(f"  [{i}] {nm}  ({ts})")
+                for i, (nm, ts, title, _) in enumerate(s):
+                    print(f"  [{i}] {title or nm}  ({ts})")
             return "continue"
 
         if c.startswith("/del "):
@@ -107,10 +119,12 @@ def main():
 
         if c.startswith("/save"):
             parts = cmd.split(None, 1)
-            name = parts[1].strip() if len(parts) > 1 else session_name[0] or default_session_name()
-            session_name[0] = name
-            sessions.save_session(name, messages)
-            print(f"  saved as '{name}'")
+            if len(parts) > 1:
+                # optional title for this session (file name stays fixed)
+                session[1] = parts[1].strip()
+            sessions.save_session(session[0], messages, title=session[1])
+            suffix = f" as '{session[1]}'" if session[1] else ""
+            print(f"  saved as '{session[0]}'{suffix}")
             return "continue"
 
         if c.startswith("/compress"):
@@ -166,7 +180,8 @@ def main():
             return "continue"
 
         if c == "/help":
-            print("  Commands: /q, /save <name>, /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
+            print("  Commands: /q, /save [title], /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
+            print("  /save [title] — save now; optionally set this session's title shown in the resume dialog")
             print("  Tools: read_file, write_file, patch, shell, browser, ask_user, write_skill, load_skill")
             return "continue"
 
@@ -180,9 +195,9 @@ def main():
             user = input(">> ").strip()
         except (EOFError, KeyboardInterrupt):
             if len(messages) > 1:
-                name = session_name[0] or default_session_name()
-                sessions.save_session(name, messages)
-                print(f"  saved as '{name}', bye.")
+                sessions.save_session(session[0], messages, title=session[1])
+                suffix = f" as '{session[1]}'" if session[1] else ""
+                print(f"  saved as '{session[0]}'{suffix}, bye.")
             break
 
         result = handle_cmd(user)
@@ -221,9 +236,9 @@ def main():
                     t.join(timeout=2)
                     # Save and return to prompt instead of exiting
                     if len(messages) > 1:
-                        name = session_name[0] or default_session_name()
-                        sessions.save_session(name, messages)
-                        print(f"  saved as '{name}', back to prompt.")
+                        sessions.save_session(session[0], messages, title=session[1])
+                        suffix = f" as '{session[1]}'" if session[1] else ""
+                        print(f"  saved as '{session[0]}'{suffix}, back to prompt.")
                     control._sigint_count = 0
                     round_interrupted = True
                     break

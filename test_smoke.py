@@ -35,6 +35,58 @@ def test_parse_xml_tool_call():
     print("ok - parse xml tool call")
 
 
+def test_parse_qwen_mixed_xml_json():
+    # Qwen mixed form: <function NAME> followed by a raw JSON params object
+    text = (
+        'I should list the media dir\n'
+        '<tool_call>\n'
+        '<function shell>\n'
+        '{\n'
+        '  "command": "ls D:\\\\QwenAgent\\\\workspace\\\\MediaManager"\n'
+        '}\n'
+        '</function>\n'
+        '</tool_call>'
+    )
+    thought, tool, params, answer = parse.parse_agent_response(text)
+    assert tool == "shell"
+    assert params == {"command": "ls D:\\QwenAgent\\workspace\\MediaManager"}
+    assert "list" in thought and answer is None
+    print("ok - parse qwen mixed xml+json")
+
+
+def test_parse_qwen_mixed_xml_json_unclosed():
+    # Model cut off mid-output: no </function>, no </tool_call>, no closing }
+    text = 'Hmm, let me check\n<tool_call>\n<function shell>\n{"command": "ls"'
+    thought, tool, params, answer = parse.parse_agent_response(text)
+    assert tool == "shell"
+    assert params == {"command": "ls"}
+    print("ok - parse qwen mixed auto-close <>, {}")
+
+
+def test_parse_qwen_mixed_nested_json():
+    # Nested object, missing a closing brace, cut off by </function>
+    text = '<tool_call><function shell>{"command": "python run.py", "env": {"mode": "prod"}</function>'
+    thought, tool, params, answer = parse.parse_agent_response(text)
+    assert tool == "shell"
+    assert params == {"command": "python run.py", "env": {"mode": "prod"}}
+    print("ok - parse qwen mixed nested json repair")
+
+
+def test_parse_qwen_mixed_windows_path():
+    # User's verbatim example: single-backslash Windows path (invalid JSON
+    # escapes) — repaired by the fallback; note the JSON is also auto-closed
+    bs = "\\"
+    text = (
+        '<tool_call>\n<function shell>\n{\n'
+        '  "command": "ls D:' + bs + 'QwenAgent' + bs + 'workspace' + bs + 'MediaManager"\n'
+        '}\n'
+    )
+    thought, tool, params, answer = parse.parse_agent_response(text)
+    assert tool == "shell"
+    assert params == {"command": "ls D:" + bs + "QwenAgent" + bs + "workspace" + bs + "MediaManager"}
+    print("ok - parse qwen mixed windows path escape repair")
+
+
 def test_parse_answer():
     thought, tool, params, answer = parse.parse_agent_response('{"thought": "done", "answer": "All done."}')
     assert tool is None and answer == "All done."
@@ -137,9 +189,91 @@ def test_system_prompt_sane():
     print("ok - system prompt")
 
 
+def test_system_diagnostics():
+    from qwen_agent import prompt
+
+    info = prompt.system_diagnostics()
+    sysname = os.uname().sysname if hasattr(os, "uname") else ""
+    expected_os = {"Windows": "windows", "Darwin": "mac", "Linux": "linux"}.get(sysname, sysname.lower())
+    assert "## System" in info
+    assert f"OS: {expected_os}" in info
+    assert "Uptime: " in info and info.split("Uptime: ")[1].splitlines()[0] not in ("unknown", "")
+    assert "Available RAM: " in info
+    print("ok - system diagnostics block:\n" + info.replace("## ", "- "))
+
+
+def test_startup_fresh_includes_diagnostics():
+    from datetime import datetime
+
+    from qwen_agent import main, skills
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old = config.SESSIONS_DIR
+        config.SESSIONS_DIR = tmp  # empty → pick_session() returns None → fresh start
+        try:
+            messages, _, session_file, session_title = main.startup_messages()
+        finally:
+            config.SESSIONS_DIR = old
+            skills.SKILLS_CACHE = []
+    assert messages[0]["role"] == "system"
+    assert "## System" in messages[0]["content"]
+    assert "OS: " in messages[0]["content"] and "Uptime: " in messages[0]["content"]
+    assert session_title is None
+    assert session_file == datetime.now().strftime("%Y%m%d_%H%M%S")
+    print("ok - fresh startup includes system diagnostics")
+
+
+def test_session_fixed_file_and_title():
+    # A session maps to exactly ONE json file forever: saves keep the start
+    # timestamp, update the title, and never create a new file.
+    from qwen_agent import sessions
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old = config.SESSIONS_DIR
+        config.SESSIONS_DIR = tmp
+        try:
+            name = "20260101_091500"  # session started Jan 1, saved "now"
+            sessions.save_session(name, [{"role": "user", "content": "first"}], title="Media manager")
+            sessions.save_session(
+                name,
+                [{"role": "user", "content": "first"}, {"role": "assistant", "content": "done"}],
+                title="Media manager v2",
+            )
+            files = os.listdir(tmp)
+            assert files == ["20260101_091500.json"], f"expected exactly one file, got {files}"
+            with open(os.path.join(tmp, files[0])) as f:
+                data = json.load(f)
+            assert data["title"] == "Media manager v2"
+            assert data["messages"][-1] == {"role": "assistant", "content": "done"}
+
+            # saving without a title keeps the existing title
+            sessions.save_session(name, [{"role": "user", "content": "first"}])
+            with open(os.path.join(tmp, files[0])) as f:
+                assert json.load(f)["title"] == "Media manager v2"
+
+            # a session started at an old date keeps that start stamp when saved now
+            rn = "20250101_000000"
+            with open(os.path.join(tmp, rn + ".json"), "w") as f:
+                json.dump({"version": 1, "timestamp": "2025-01-01 00:00:00", "messages": []}, f)
+            sessions.save_session(rn, [{"role": "user", "content": "resumed work"}])
+            with open(os.path.join(tmp, rn + ".json")) as f:
+                assert json.load(f)["timestamp"] == "2025-01-01 00:00:00"
+
+            # list_sessions exposes the title for the resume dialog
+            listing = sessions.list_sessions()
+            assert ("20260101_091500", "Media manager v2") in [(n, t) for n, _, t, _ in listing]
+        finally:
+            config.SESSIONS_DIR = old
+    print("ok - session fixed file + title")
+
+
 if __name__ == "__main__":
     test_parse_json_tool_call()
     test_parse_xml_tool_call()
+    test_parse_qwen_mixed_xml_json()
+    test_parse_qwen_mixed_xml_json_unclosed()
+    test_parse_qwen_mixed_nested_json()
+    test_parse_qwen_mixed_windows_path()
     test_parse_answer()
     test_parse_unparseable()
     test_context_display_and_compress_trigger()
@@ -149,4 +283,7 @@ if __name__ == "__main__":
     test_tools_dispatch()
     test_tool_map_complete()
     test_system_prompt_sane()
+    test_system_diagnostics()
+    test_startup_fresh_includes_diagnostics()
+    test_session_fixed_file_and_title()
     print("\nALL SMOKE TESTS PASSED")

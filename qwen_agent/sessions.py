@@ -19,7 +19,12 @@ def session_path(name):
 
 
 def list_sessions():
-    """Return sorted list of (name, timestamp, preview)."""
+    """Return sorted list of (name, timestamp, title, preview).
+
+    ``name`` is the session's fixed JSON file (without extension) — created
+    once at session start and reused for every later save. ``title`` is the
+    user-set display title or None.
+    """
     os.makedirs(config.SESSIONS_DIR, exist_ok=True)
     sessions = []
     for fname in sorted(os.listdir(config.SESSIONS_DIR), reverse=True):
@@ -31,6 +36,7 @@ def list_sessions():
             with open(path) as f:
                 data = json.load(f)
             ts = data.get("timestamp", "?")
+            title = data.get("title") or None
             msgs = data.get("messages", [])
             # Find the first user message after the system prompt
             preview = ""
@@ -38,15 +44,38 @@ def list_sessions():
                 if m.get("role") == "user" and m.get("content"):
                     preview = m["content"][:MAX_SESSION_DISPLAY]
                     break
-            sessions.append((name, ts, preview))
+            sessions.append((name, ts, title, preview))
         except Exception:
-            sessions.append((name, "?", "(corrupt)"))
+            sessions.append((name, "?", None, "(corrupt)"))
     return sessions
 
 
-def save_session(name, messages):
-    """Save current messages + metadata to sessions/{name}.json."""
+def save_session(name, messages, title=None):
+    """Save messages to sessions/{name}.json and return the file name.
+
+    A session's file is fixed for its lifetime: created once (``name`` is the
+    start-date stamp) and updated in place on every later save — a session
+    never spawns a new JSON file. The stored ``timestamp`` is the session
+    start, not the save time. ``title`` is the optional user-set display
+    title; passing None keeps an existing title.
+    """
     os.makedirs(config.SESSIONS_DIR, exist_ok=True)
+    path = session_path(name)
+
+    # Preserve the session-start timestamp and title across saves
+    started = None
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                saved = json.load(f)
+            started = saved.get("timestamp")
+            if title is None:
+                title = saved.get("title")
+        except Exception:
+            pass
+    if started is None:
+        started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     # Strip tool results and parsing-noise — save only user/assistant turns for resume
     clean = [
         m for m in messages
@@ -69,12 +98,14 @@ def save_session(name, messages):
 
     data = {
         "version": 1,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "timestamp": started,
         "model": config.MODEL,
         "endpoint": config.BASE_URL,
         "messages": stripped,
     }
-    with open(session_path(name), "w") as f:
+    if title:
+        data["title"] = title
+    with open(path, "w") as f:
         json.dump(data, f, indent=2)
     return name
 
@@ -96,16 +127,23 @@ def delete_session(name):
 
 
 def pick_session():
-    """Show saved sessions and let the user pick one to resume. Returns messages or None."""
+    """Show saved sessions and let the user pick one to resume.
+
+    Returns (name, title, messages) or None. ``name`` is the session's fixed
+    JSON file (without extension) — a resumed session keeps writing to that
+    same file. Saved-session dialog shows the user-set title when present,
+    falling back to the file name.
+    """
     sessions = list_sessions()
     if not sessions:
         return None
 
     print(f"\n  Saved sessions ({len(sessions)}):")
     print(f"  {'':─>60}")
-    for i, (name, ts, preview) in enumerate(sessions):
+    for i, (name, ts, title, preview) in enumerate(sessions):
+        label = title or name
         short = preview[:128].replace("\n", " ") if preview else "(empty)"
-        print(f"  [{i}] {name}  ({ts})")
+        print(f"  [{i}] {label}  ({ts})")
         print(f"      {config.GOLD}{short}{config.RESET}")
     print(f"  [n] Start fresh")
     print()
@@ -120,10 +158,11 @@ def pick_session():
         try:
             idx = int(choice)
             if 0 <= idx < len(sessions):
-                msgs = load_session(sessions[idx][0])
+                name, ts, title, _ = sessions[idx]
+                msgs = load_session(name)
                 if msgs:
-                    print(f"  resumed session: {sessions[idx][0]}")
-                    return msgs
+                    print(f"  resumed session: {title or name}")
+                    return name, title, msgs
                 print("  (session file corrupt, skipping)")
         except (ValueError, IndexError):
             print("  enter a number or 'n'")
