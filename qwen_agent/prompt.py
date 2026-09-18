@@ -96,3 +96,112 @@ Rules:
 - If a tool errors, analyse the message and try a different approach.
 - Do not guess file paths — list the directory with `shell("ls")` or `shell("find ...")` first.
 - Verify your work after writing (e.g. `shell("python script.py")` or re-read the file)."""
+
+import platform
+import time
+
+
+def system_diagnostics():
+    """Probe basic system facts, appended to the system prompt on a new session.
+
+    Reports OS family (windows / mac / linux), uptime and available RAM.
+    Never raises — any probe failure degrades to "unknown" so startup is
+    never blocked by an exotic environment.
+    """
+    sysname = platform.system()
+    if sysname == "Windows":
+        os_label = "windows"
+    elif sysname == "Darwin":
+        os_label = "mac"
+    elif sysname == "Linux":
+        os_label = "linux"
+    else:
+        os_label = (sysname or "unknown").lower()
+
+    return (
+        "## System\n"
+        f"- OS: {os_label}\n"
+        f"- Uptime: {_uptime_str(sysname)}\n"
+        f"- Available RAM: {_available_ram_str(sysname)}"
+    )
+
+
+def _uptime_str(sysname):
+    try:
+        if sysname == "Linux":
+            with open("/proc/uptime") as f:
+                seconds = float(f.read().split()[0])
+        elif sysname == "Windows":
+            import ctypes
+            seconds = ctypes.windll.kernel32.GetTickCount64() / 1000.0
+        elif sysname == "Darwin":
+            import re
+            import subprocess
+            out = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
+            boot_sec = int(re.search(r"sec = (\d+)", out).group(1))
+            seconds = time.time() - boot_sec
+        else:
+            return "unknown"
+    except Exception:
+        return "unknown"
+
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+def _available_ram_str(sysname):
+    try:
+        if sysname == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        mb = int(line.split()[1]) // 1024  # kB -> MB
+                        break
+                else:
+                    return "unknown"
+        elif sysname == "Windows":
+            import ctypes
+
+            class _MemStat(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MemStat()
+            stat.dwLength = ctypes.sizeof(stat)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            mb = stat.ullAvailPhys // (1024 * 1024)
+        elif sysname == "Darwin":
+            import subprocess
+            page = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"], text=True))
+            out = subprocess.check_output(["vm_stat"], text=True)
+            pages = 0
+            for line in out.splitlines():
+                key, _, val = line.partition(":")
+                key = key.strip()
+                if key in ("Pages free", "Pages inactive", "Pages speculative"):
+                    pages += int(val.strip().rstrip("."))
+            mb = (pages * page) // (1024 * 1024)
+        else:
+            return "unknown"
+    except Exception:
+        return "unknown"
+
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    return f"{mb} MB"
