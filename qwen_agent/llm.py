@@ -63,18 +63,22 @@ def llm_chat(messages, label=""):
         print()
 
     if not cancelled:
-        # Completed normally — clear the streaming output
-        def terminal_rows(t):
-            rows = 0
-            for line in t.split("\n"):
-                rows += max(1, (len(line) + cols - 1) // cols)
-            return rows
+        # Completed normally — clear the streaming output. The erase uses
+        # ANSI cursor control, which cmd.exe/PowerShell mangle — and it would
+        # only clutter captured logs, so skip it entirely when styling is off
+        # (Windows) and leave the streamed text visible.
+        if config.STYLING:
+            def terminal_rows(t):
+                rows = 0
+                for line in t.split("\n"):
+                    rows += max(1, (len(line) + cols - 1) // cols)
+                return rows
 
-        rows = 1 + terminal_rows(text)
-        for _ in range(rows):
-            sys.stdout.write("\033[2K\033[A")
-        sys.stdout.write("\033[2K")
-        sys.stdout.flush()
+            rows = 1 + terminal_rows(text)
+            for _ in range(rows):
+                sys.stdout.write("\033[2K\033[A")
+            sys.stdout.write("\033[2K")
+            sys.stdout.flush()
     else:
         # Cancelled — leave partial output visible
         sys.stdout.write(f"{config.GREY}  (cancelled){config.RESET}\n")

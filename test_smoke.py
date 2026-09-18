@@ -267,6 +267,40 @@ def test_session_fixed_file_and_title():
     print("ok - session fixed file + title")
 
 
+def test_colors_enabled_on_posix():
+    from qwen_agent import config
+
+    if os.name == "nt":
+        print("skipped - running on windows, styling intentionally off")
+        return
+    assert config.STYLING is True
+    assert config.GREY and config.GREEN and config.GOLD and config.RED and config.RESET
+    print("ok - colors enabled on posix")
+
+
+def test_styling_disabled_on_windows():
+    # Simulate a Windows host: every ANSI sequence must be gone from the
+    # emitted output — colors blanked and context display escape-free.
+    from unittest import mock
+
+    import importlib
+
+    from qwen_agent import config, context
+
+    with mock.patch("os.name", "nt"):
+        importlib.reload(config)
+        try:
+            assert config.STYLING is False
+            assert config.GREY == config.GREEN == config.GOLD == config.RED == config.RESET == ""
+            disp = context.context_display([{"role": "system", "content": "x"}])
+            assert "\033" not in disp, disp
+        finally:
+            pass
+    importlib.reload(config)  # restore real-platform constants after patch lifts
+    assert config.STYLING == (os.name != "nt")
+    print("ok - styling disabled on windows")
+
+
 if __name__ == "__main__":
     test_parse_json_tool_call()
     test_parse_xml_tool_call()
@@ -286,4 +320,6 @@ if __name__ == "__main__":
     test_system_diagnostics()
     test_startup_fresh_includes_diagnostics()
     test_session_fixed_file_and_title()
+    test_colors_enabled_on_posix()
+    test_styling_disabled_on_windows()
     print("\nALL SMOKE TESTS PASSED")

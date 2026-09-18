@@ -42,8 +42,9 @@ def context_display(messages):
     used = estimate_tokens(messages)
     pct = (used / config.CONTEXT_LENGTH * 100) if config.CONTEXT_LENGTH else 0
     # Color the percentage: green < 50%, gold < 75%, red >= 75%
+    # (all constants empty when terminal styling is disabled, e.g. Windows)
     if pct >= 75:
-        color = "\033[31m"  # red
+        color = config.RED
     elif pct >= 50:
         color = config.GOLD
     else:
