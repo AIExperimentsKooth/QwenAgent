@@ -51,19 +51,68 @@ WORKSPACE_DIR = repo_path("QWEN_WORKSPACE_DIR", "workspace")
 client = OpenAI(base_url=BASE_URL, api_key=API_KEY or "not-needed", timeout=None, max_retries=0)
 
 
+FALLBACK_MODEL = "qwen3.8-27b-obliterated@iq4_xs"
+
+
+def fetch_model_ids(timeout=30):
+    """Return the ids of every model the backend reports as loaded (deduped).
+
+    The order matches the backend's /v1/models response (first occurrence
+    wins for duplicates/aliases)."""
+    req = urllib.request.Request(BASE_URL + "/models")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read())
+    ids = []
+    for m in data.get("data", []):
+        mid = m.get("id") if isinstance(m, dict) else None
+        if mid and mid not in ids:
+            ids.append(mid)
+    return ids
+
+
 def detect_model():
-    """Query /v1/models and use whatever is loaded. Falls back to QWEN_MODEL env var."""
+    """Pick the model to chat with.
+
+    Resolution order, never a silent guess with several models loaded:
+      1. ``QWEN_MODEL`` env var, if set;
+      2. exactly one loaded model -> auto-detect it;
+      3. several loaded models -> list them and ask the user (Empty picks
+         the first, shown clearly);
+      4. none reachable / nothing loaded -> hardcoded fallback with a
+         visible warning.
+    """
     if MODEL:
         return MODEL
     try:
-        req = urllib.request.Request(BASE_URL + "/models")
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-        models = data.get("data", [])
-        if models:
-            detected = models[0]["id"]
-            print(f"  detected model: {detected}")
-            return detected
+        loaded = fetch_model_ids()
     except Exception as e:
-        print(f"  model detection failed ({e}), fallback to env or hardcoded")
-    return "qwen3.8-27b-obliterated@iq4_xs"
+        print(f"  {RED}model detection failed ({e}); set QWEN_MODEL or check {BASE_URL}{RESET}")
+        loaded = []
+    if not loaded:
+        print(f"  {RED}no models reported by {BASE_URL} — using hardcoded fallback model{RESET}")
+        return FALLBACK_MODEL
+    if len(loaded) == 1:
+        print(f"  detected model: {loaded[0]}")
+        return loaded[0]
+
+    # Multiple models loaded — never route prompts at an arbitrary pick.
+    print(f"  {GOLD}multiple models loaded ({len(loaded)}):{RESET}")
+    for i, mid in enumerate(loaded):
+        print(f"    [{i}] {mid}")
+    while True:
+        try:
+            choice = input(f"  which model [0-{len(loaded) - 1}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"  no input — using: {loaded[0]}")
+            return loaded[0]
+        if choice == "":
+            print(f"  using: {loaded[0]}")
+            return loaded[0]
+        try:
+            idx = int(choice)
+            if 0 <= idx < len(loaded):
+                print(f"  using: {loaded[idx]}")
+                return loaded[idx]
+        except ValueError:
+            pass
+        print("  enter a number from the list above")

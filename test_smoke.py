@@ -267,6 +267,82 @@ def test_session_fixed_file_and_title():
     print("ok - session fixed file + title")
 
 
+def test_detect_model_single():
+    from unittest import mock
+
+    from qwen_agent import config
+
+    with mock.patch.object(config, "MODEL", None), \
+         mock.patch.object(config, "fetch_model_ids", return_value=["qwen-27b"]):
+        assert config.detect_model() == "qwen-27b"
+    print("ok - detect model single")
+
+
+def test_detect_model_multiple_choice():
+    from unittest import mock
+
+    from qwen_agent import config
+
+    with mock.patch.object(config, "MODEL", None), \
+         mock.patch.object(config, "fetch_model_ids", return_value=["model-a", "model-b"]):
+        with mock.patch("builtins.input", return_value="1"):
+            assert config.detect_model() == "model-b"
+        with mock.patch("builtins.input", return_value=""):
+            assert config.detect_model() == "model-a"
+        with mock.patch("builtins.input", side_effect=EOFError):
+            assert config.detect_model() == "model-a"
+    print("ok - detect model multiple: explicit + empty/EOF default to first")
+
+
+def test_detect_model_invalid_then_valid():
+    from unittest import mock
+
+    from qwen_agent import config
+
+    with mock.patch.object(config, "MODEL", None), \
+         mock.patch.object(config, "fetch_model_ids", return_value=["a", "b", "c"]):
+        with mock.patch("builtins.input", side_effect=["9", "xyz", "2"]):
+            assert config.detect_model() == "c"
+    print("ok - detect model rejects invalid input")
+
+
+def test_detect_model_none_fallback():
+    from unittest import mock
+
+    from qwen_agent import config
+
+    with mock.patch.object(config, "MODEL", None), \
+         mock.patch.object(config, "fetch_model_ids", return_value=[]):
+        assert config.detect_model() == config.FALLBACK_MODEL
+    print("ok - detect model none -> fallback")
+
+
+def test_fetch_model_ids_dedupe_and_skips_bad_entries():
+    from unittest import mock
+
+    from qwen_agent import config
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(self._payload).encode()
+
+    fake = FakeResp({"data": [
+        {"id": "dup-a"}, {"id": "real"}, {"id": "dup-a"}, {"object": "no-id"}, "garbage",
+    ]})
+    with mock.patch.object(config.urllib.request, "urlopen", return_value=fake):
+        assert config.fetch_model_ids() == ["dup-a", "real"]
+    print("ok - fetch_model_ids dedupes + skips bad entries")
+
+
 def test_colors_enabled_on_posix():
     from qwen_agent import config
 
@@ -320,6 +396,11 @@ if __name__ == "__main__":
     test_system_diagnostics()
     test_startup_fresh_includes_diagnostics()
     test_session_fixed_file_and_title()
+    test_detect_model_single()
+    test_detect_model_multiple_choice()
+    test_detect_model_invalid_then_valid()
+    test_detect_model_none_fallback()
+    test_fetch_model_ids_dedupe_and_skips_bad_entries()
     test_colors_enabled_on_posix()
     test_styling_disabled_on_windows()
     print("\nALL SMOKE TESTS PASSED")
