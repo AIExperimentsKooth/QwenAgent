@@ -9,6 +9,13 @@ Minimal tool-calling loop over any OpenAI-compatible endpoint. Designed for runn
 ./boot.sh
 ```
 
+**Windows** (from the repo folder, in cmd or PowerShell):
+
+```
+install.bat
+start.bat
+```
+
 To update the checkout and reinstall dependencies:
 
 ```bash
@@ -89,7 +96,15 @@ Drop `.md` files into `skills/`. They're loaded into the system prompt wrapped a
 
 - Python 3.10+
 - `openai` package (installed in `.venv/`)
-- browser-harness CLI (installed by `./install.sh`): `uv tool install --python 3.12 --upgrade --force browser-harness`
+- browser-harness CLI (installed by `./install.sh` / `install.bat`): `uv tool install --python 3.12 --upgrade --force browser-harness`
+
+Windows notes:
+
+- Run `install.bat` instead of `./install.sh`, then `start.bat` instead of `./boot.sh`.
+- `uv` must be installed first (https://docs.astral.sh/uv/); install.sh/install.bat do not install it for you.
+- `install.bat` requires Python 3.10+ on PATH.
+- The bat scripts are plain ASCII; run them from cmd. PowerShell works too: `.\install.bat`.
+- Both bat scripts `pause` before the window closes (on success and on error), so messages stay readable when launched by double-click.
 
 ## Architecture
 

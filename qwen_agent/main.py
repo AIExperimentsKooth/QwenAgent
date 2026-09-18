@@ -65,6 +65,30 @@ def startup_messages():
     return messages, skills_list, session_file, session_title
 
 
+def _stdin_ready(timeout):
+    """Return True if stdin has pending input, waiting up to ``timeout``.
+
+    POSIX uses ``select``. Windows ``select`` only supports sockets (not
+    stdin), so it polls ``msvcrt.kbhit`` instead. Falls back to "ready"
+    on error so the blocking ``readline()`` decides (e.g. piped input).
+    """
+    if os.name == "nt":
+        import msvcrt
+        import time
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if msvcrt.kbhit():
+                    return True
+            except OSError:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    return bool(ready)
+
+
 def main():
     # Ensure the default workspace directory exists and switch into it
     os.makedirs(config.WORKSPACE_DIR, exist_ok=True)
@@ -243,8 +267,7 @@ def main():
                     round_interrupted = True
                     break
 
-                ready, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if ready:
+                if _stdin_ready(0.1):
                     line = sys.stdin.readline().strip()
                     # If it was just a stray newline from terminal, skip
                     if not line and not user_during_stream:
