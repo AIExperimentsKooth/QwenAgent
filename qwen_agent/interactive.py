@@ -72,7 +72,7 @@ def tool_write_skill_impl(name, content, msgs):
         fname = name
     path = os.path.join(config.SKILLS_DIR, fname)
     os.makedirs(config.SKILLS_DIR, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     count = reload_skills_into_system(msgs)
     return json.dumps({

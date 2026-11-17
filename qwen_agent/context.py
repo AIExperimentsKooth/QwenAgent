@@ -114,13 +114,12 @@ def compress_history(messages):
     ]
 
     try:
-        resp = config.client.chat.completions.create(
+        summary = config.chat(
+            summary_prompt,
             model=c_model,
-            messages=summary_prompt,
             temperature=0.1,
             max_tokens=1024,
-        )
-        summary = resp.choices[0].message.content.strip()
+        ).strip()
         print(f"{config.GREY}  compressed {len(to_compress)} messages -> 1 summary{config.RESET}")
     except Exception as e:
         print(f"{config.GREY}  compression failed ({e}), keeping history{config.RESET}")

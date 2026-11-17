@@ -13,7 +13,12 @@ from . import config, context, control
 
 
 def llm_chat(messages, label=""):
-    """Stream model output to terminal. Returns (text, cancelled)."""
+    """Stream model output to terminal. Returns (text, cancelled, error).
+
+    ``error`` is None on success. A transport-level failure (endpoint down,
+    HTTP error) is reported once instead of being fed back to the model as
+    an unparseable answer, so the loop returns straight to the prompt.
+    """
     cols = shutil.get_terminal_size().columns
 
     header = f"  {label}" if label else ""
@@ -23,46 +28,46 @@ def llm_chat(messages, label=""):
     control._stream_stop.clear()
     control._stream_active.set()
 
+    # Consolidate system messages — many GGUF backends reject
+    # multiple system messages or mid-turn system messages.
+    safe_msgs = context.consolidate_system_msgs(messages)
+    parts = []
+    error = None
+    stream = None
     try:
-        # Consolidate system messages — many GGUF backends reject
-        # multiple system messages or mid-turn system messages.
-        safe_msgs = context.consolidate_system_msgs(messages)
-        stream = config.client.chat.completions.create(
+        stream = config.stream_chat(
+            safe_msgs,
             model=config.MODEL,
-            messages=safe_msgs,
             temperature=0.1,
             max_tokens=config.MAX_TOKENS,
-            stream=True,
         )
-    except Exception as e:
-        control._stream_active.clear()
-        return f"  error: {e}", False
-
-    parts = []
-    try:
-        for chunk in stream:
+        for token in stream:
             if control._stream_stop.is_set():
-                try:
-                    stream.close()
-                except Exception:
-                    pass
                 break
-            token = chunk.choices[0].delta.content or ""
             parts.append(token)
             sys.stdout.write(f"{config.GREY}{token}{config.RESET}")
             sys.stdout.flush()
     except Exception as e:
+        error = str(e) or e.__class__.__name__
+    finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
         control._stream_active.clear()
-        return f"  error: {e}", False
 
-    control._stream_active.clear()
     cancelled = control._stream_stop.is_set()
 
     text = "".join(parts)
     if text and not text.endswith("\n"):
         print()
 
-    if not cancelled:
+    if cancelled:
+        # Cancelled — leave partial output visible
+        sys.stdout.write(f"{config.GREY}  (cancelled){config.RESET}\n")
+        sys.stdout.flush()
+    elif error is None:
         # Completed normally — clear the streaming output
         def terminal_rows(t):
             rows = 0
@@ -75,9 +80,5 @@ def llm_chat(messages, label=""):
             sys.stdout.write("\033[2K\033[A")
         sys.stdout.write("\033[2K")
         sys.stdout.flush()
-    else:
-        # Cancelled — leave partial output visible
-        sys.stdout.write(f"{config.GREY}  (cancelled){config.RESET}\n")
-        sys.stdout.flush()
 
-    return text.strip(), cancelled
+    return text.strip(), cancelled, error

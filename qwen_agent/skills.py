@@ -12,6 +12,13 @@ from . import config
 
 SKILLS_CACHE = []  # list of (name, description, content)
 
+# Skills that only make sense when an optional tool is installed. The
+# bundled browser skill documents the browser-harness CLI, so it is not
+# advertised when that CLI is missing.
+OPTIONAL_SKILLS = {
+    "browser-harness": lambda: config.BROWSER_ENABLED,
+}
+
 
 def extract_description(body):
     """Extract description from YAML frontmatter, or use first line."""
@@ -43,9 +50,13 @@ def load_skills():
     for fname in names:
         if not fname.endswith(".md"):
             continue
+        # "browser-harness.SKILL.md" → "browser-harness"
+        enabled = OPTIONAL_SKILLS.get(fname[:-3].split(".")[0])
+        if enabled is not None and not enabled():
+            continue
         path = os.path.join(config.SKILLS_DIR, fname)
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 body = f.read().strip()
             name = fname[:-3]
             desc = extract_description(body)

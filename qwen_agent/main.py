@@ -11,6 +11,7 @@ import queue
 import select
 import sys
 import threading
+import time
 from datetime import datetime
 
 from . import (
@@ -206,7 +207,7 @@ def main():
         if c == "/help":
             print("  Commands: /q, /save [title], /list, /del <name>, /compress, /config, /skills, /reload-skills, /help")
             print("  /save [title] — save now; optionally set this session's title shown in the resume dialog")
-            print("  Tools: read_file, write_file, patch, shell, browser, ask_user, write_skill, load_skill")
+            print(f"  Tools: {', '.join(tools.TOOL_MAP)}")
             return "continue"
 
         return None  # not a command
@@ -246,14 +247,15 @@ def main():
             result_q = queue.Queue()
 
             def stream_worker(msgs, rnd, q):
-                raw_text, was_cancelled = llm.llm_chat(msgs, label=f"round {rnd}")
-                q.put((raw_text, was_cancelled))
+                raw_text, was_cancelled, error = llm.llm_chat(msgs, label=f"round {rnd}")
+                q.put((raw_text, was_cancelled, error))
 
             t = threading.Thread(target=stream_worker, args=(messages, _round, result_q), daemon=True)
             t.start()
 
             # Poll for user input while the model streams
             user_during_stream = None
+            stdin_closed = False
             while t.is_alive():
                 if control._sigint_count > 0:
                     control._stream_stop.set()
@@ -267,8 +269,17 @@ def main():
                     round_interrupted = True
                     break
 
+                if stdin_closed:
+                    # Piped stdin at EOF: readable forever, but nothing more
+                    # can arrive. Sleep instead of spinning on the stream.
+                    time.sleep(0.1)
+                    continue
                 if _stdin_ready(0.1):
-                    line = sys.stdin.readline().strip()
+                    raw = sys.stdin.readline()
+                    if raw == "":
+                        stdin_closed = True  # EOF on stdin (piped input)
+                        continue
+                    line = raw.strip()
                     # If it was just a stray newline from terminal, skip
                     if not line and not user_during_stream:
                         continue
@@ -279,9 +290,16 @@ def main():
 
             # Collect the result
             try:
-                raw, cancelled = result_q.get_nowait()
+                raw, cancelled, llm_error = result_q.get_nowait()
             except queue.Empty:
-                raw, cancelled = "", False
+                raw, cancelled, llm_error = "", False, None
+
+            # Endpoint unreachable / HTTP error: report once and go back to
+            # the prompt instead of retrying the same failing request.
+            if llm_error is not None:
+                print(f"{config.RED}  error: {llm_error}{config.RESET}", flush=True)
+                round_interrupted = True
+                break
 
             if cancelled and user_during_stream is not None:
                 # User typed something mid-stream
@@ -382,9 +400,12 @@ def main():
         else:
             print("  (max rounds reached)")
             messages.append({"role": "system", "content": "You have reached the maximum number of tool rounds. If the task is complete, give your final answer. If not, state what remains."})
-            raw, _ = llm.llm_chat(messages)
-            thought, _, _, answer = parse.parse_agent_response(raw)
-            print(f"{config.GOLD}  final: {answer or raw[:500]}{config.RESET}")
+            raw, _, llm_error = llm.llm_chat(messages)
+            if llm_error is not None:
+                print(f"{config.RED}  error: {llm_error}{config.RESET}")
+            else:
+                thought, _, _, answer = parse.parse_agent_response(raw)
+                print(f"{config.GOLD}  final: {answer or raw[:500]}{config.RESET}")
 
         print()
 

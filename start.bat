@@ -1,23 +1,24 @@
 @echo off
 rem QwenAgent start script for Windows
-rem Runs harness.py with the .venv Python and puts uv's tool bin dir on
-rem PATH so the browser tool can find browser-harness.
+rem Runs harness.py with the .venv Python when one exists, otherwise the
+rem python on PATH. No third-party packages are required.
 setlocal
 cd /d "%~dp0"
 title QwenAgent Harness
 
-if not exist ".venv\Scripts\python.exe" (
-    echo [error] .venv is missing; run install.bat first.
-    echo.
-    pause
-    exit /b 1
-)
+if exist ".venv\Scripts\python.exe" goto havevenv
 
-rem uv installs tool executables to %USERPROFILE%\.local\bin, which is often not on PATH.
-set "PATH=%USERPROFILE%\.local\bin;%PATH%"
+where python >nul 2>nul
+if errorlevel 1 goto nopython
+set "PY=python"
+goto run
 
+:havevenv
+set "PY=.venv\Scripts\python.exe"
+
+:run
 echo [boot] starting harness.py
-".venv\Scripts\python.exe" "%~dp0harness.py" %*
+"%PY%" "%~dp0harness.py" %*
 set "RC=%ERRORLEVEL%"
 
 echo.
@@ -28,3 +29,9 @@ echo --- QwenAgent has exited. ---
 echo.
 pause
 exit /b %RC%
+
+:nopython
+echo [error] python not found on PATH. Install Python 3.10+ and retry.
+echo.
+pause
+exit /b 1

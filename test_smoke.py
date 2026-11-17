@@ -1,15 +1,17 @@
 """Behavioral sanity checks for the refactored qwen_agent package.
 
-Run inside the repo root with the project venv activated:
+Run inside the repo root — standard library only, no pytest or venv needed:
 
-    .venv/bin/python -m pytest -q  (requires pytest)
-    .venv/bin/python test_smoke.py  (no pytest needed)
+    python test_smoke.py
+    python -m pytest -q   (optional, if pytest is installed)
 """
 
 import json
 import os
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -178,15 +180,75 @@ def test_tools_dispatch():
 def test_tool_map_complete():
     from qwen_agent import tools
 
-    for name in ("read_file", "write_file", "patch", "shell", "browser", "ask_user", "write_skill", "load_skill"):
+    for name in ("read_file", "write_file", "patch", "shell", "ask_user", "write_skill", "load_skill"):
         assert name in tools.TOOL_MAP
+    assert ("browser" in tools.TOOL_MAP) == config.BROWSER_ENABLED
     print("ok - tool map complete")
 
 
 def test_system_prompt_sane():
-    assert "read_file" in SYSTEM_PROMPT and "browser" in SYSTEM_PROMPT and "load_skill" in SYSTEM_PROMPT
+    assert "read_file" in SYSTEM_PROMPT and "load_skill" in SYSTEM_PROMPT
     assert "## Protocol" in SYSTEM_PROMPT
     print("ok - system prompt")
+
+
+def test_prompt_matches_tools():
+    # The prompt must only advertise tools the dispatcher actually has —
+    # the count and the browser section track the environment.
+    from qwen_agent import prompt, tools
+
+    names = prompt.tool_names()
+    assert set(names) == set(tools.TOOL_MAP), (names, list(tools.TOOL_MAP))
+    assert f"access to {len(names)} tools" in SYSTEM_PROMPT
+    assert ("browser(code)" in SYSTEM_PROMPT) == config.BROWSER_ENABLED
+    print(f"ok - prompt advertises {len(names)} tools")
+
+
+def test_browser_skill_hidden_without_cli():
+    from qwen_agent import skills
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old = config.SKILLS_DIR
+        config.SKILLS_DIR = tmp
+        try:
+            # The bundled file is named browser-harness.SKILL.md — cover both
+            # that and a plain browser-harness.md.
+            for fname in ("browser-harness.SKILL.md", "browser-harness.md"):
+                with open(os.path.join(tmp, fname), "w", encoding="utf-8") as f:
+                    f.write("---\ndescription: browser skill\n---\n# Browser")
+            cache, summary = skills.load_skills()
+            if config.BROWSER_ENABLED:
+                assert sorted(n for n, _, _ in cache) == ["browser-harness", "browser-harness.SKILL"]
+            else:
+                assert cache == [] and summary == ""
+        finally:
+            config.SKILLS_DIR = old
+            skills.SKILLS_CACHE = []
+    print("ok - optional browser skill gated on browser-harness")
+
+
+def test_browser_tool_optional():
+    from qwen_agent import config as cfg, tools
+
+    if cfg.BROWSER_ENABLED:
+        print("ok - browser tool enabled (browser-harness present)")
+        return
+
+    # Absent CLI: the tool must be unadvertised and report cleanly.
+    assert "browser" not in tools.TOOL_MAP
+    payload = json.loads(tools.tool_browser("print(1)"))
+    assert "unavailable" in payload["error"], payload
+
+    # Simulated install: the configured command is executed with the code
+    # on stdin and its output is returned.
+    old_cmd, old_enabled = cfg.BROWSER_CMD, cfg.BROWSER_ENABLED
+    cfg.BROWSER_CMD, cfg.BROWSER_ENABLED = sys.executable, True
+    try:
+        payload = json.loads(tools.tool_browser('print("browser ok")'))
+    finally:
+        cfg.BROWSER_CMD, cfg.BROWSER_ENABLED = old_cmd, old_enabled
+    assert payload["exit_code"] == 0 and "browser ok" in payload["output"], payload
+    print("ok - optional browser tool degrades and runs when configured")
 
 
 def test_system_diagnostics():
@@ -267,6 +329,91 @@ def test_session_fixed_file_and_title():
     print("ok - session fixed file + title")
 
 
+# ── stdlib LLM client (no SDK) ─────────────────────────────────────────
+
+class _StubEndpoint(BaseHTTPRequestHandler):
+    """Minimal OpenAI-compatible endpoint serving /v1/chat/completions."""
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"{}")
+        if body.get("model") == "missing":
+            payload = b'{"error": "model not loaded"}'
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                for frame in (
+                    b'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n',
+                    b": keep-alive\n\n",
+                    b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+                    b"data: [DONE]\n\n",
+                ):
+                    self.wfile.write(frame)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError):
+                pass  # the client closed mid-stream (cancellation test)
+            return
+        payload = json.dumps({"choices": [{"message": {"content": "hi there"}}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+def test_stdlib_llm_client():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _StubEndpoint)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    old = config.BASE_URL
+    config.BASE_URL = f"http://127.0.0.1:{server.server_address[1]}/v1"
+    try:
+        assert config.chat([{"role": "user", "content": "hi"}]) == "hi there"
+        assert "".join(config.stream_chat([{"role": "user", "content": "hi"}])) == "Hello"
+
+        # A cancelled stream must release its socket without hanging.
+        gen = config.stream_chat([{"role": "user", "content": "hi"}])
+        assert next(gen) == "Hel"
+        gen.close()
+
+        try:
+            config.chat([{"role": "user", "content": "hi"}], model="missing")
+        except RuntimeError as e:
+            assert "HTTP 404" in str(e) and "model not loaded" in str(e), e
+        else:
+            raise AssertionError("expected an HTTP error")
+    finally:
+        config.BASE_URL = old
+        server.shutdown()
+        server.server_close()
+    print("ok - stdlib chat + streaming SSE client")
+
+
+def test_llm_client_unreachable_message():
+    old = config.BASE_URL
+    config.BASE_URL = "http://127.0.0.1:1/v1"
+    try:
+        try:
+            config.chat([{"role": "user", "content": "hi"}])
+        except RuntimeError as e:
+            assert "cannot reach" in str(e), e
+        else:
+            raise AssertionError("expected a connection error")
+    finally:
+        config.BASE_URL = old
+    print("ok - unreachable endpoint error is readable")
+
+
 if __name__ == "__main__":
     test_parse_json_tool_call()
     test_parse_xml_tool_call()
@@ -286,4 +433,9 @@ if __name__ == "__main__":
     test_system_diagnostics()
     test_startup_fresh_includes_diagnostics()
     test_session_fixed_file_and_title()
+    test_prompt_matches_tools()
+    test_browser_skill_hidden_without_cli()
+    test_browser_tool_optional()
+    test_stdlib_llm_client()
+    test_llm_client_unreachable_message()
     print("\nALL SMOKE TESTS PASSED")

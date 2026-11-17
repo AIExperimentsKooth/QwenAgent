@@ -18,7 +18,7 @@ def tool_read_file(path, offset=1, limit=2000):
     path = os.path.expanduser(path)
     if not os.path.isfile(path):
         return json.dumps({"error": f"File not found: {path}"})
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
     total = len(lines)
     start = max(0, offset - 1)
@@ -30,7 +30,7 @@ def tool_read_file(path, offset=1, limit=2000):
 def tool_write_file(path, content):
     path = os.path.expanduser(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     size = os.path.getsize(path)
     return json.dumps({"path": path, "bytes_written": size, "status": "ok"})
@@ -40,13 +40,13 @@ def tool_patch(path, old_string, new_string):
     path = os.path.expanduser(path)
     if not os.path.isfile(path):
         return json.dumps({"error": f"File not found: {path}"})
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
     count = text.count(old_string)
     if count == 0:
         return json.dumps({"error": f"old_string not found in {path}", "searched_for": old_string[:80]})
     text = text.replace(old_string, new_string, 1)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return json.dumps({"path": path, "replacements": 1, "status": "ok"})
 
@@ -80,6 +80,9 @@ BH_WORKSPACE = config.repo_path("QWEN_TOOLBIN_DIR", "toolbin")
 def tool_browser(code):
     """Run Python code through browser-harness CLI (CDP browser automation).
 
+    Optional feature: browser-harness is not required, and this tool is only
+    advertised to the agent when the CLI is installed (config.BROWSER_ENABLED).
+
     Accepts multi-line Python code using the pre-imported browser helpers:
       new_tab(url)   — open URL in new tab
       goto_url(url)  — navigate current tab
@@ -96,12 +99,16 @@ def tool_browser(code):
     First call in a session typically starts with new_tab(url).
     Returns stdout from browser-harness.
     """
+    if not config.BROWSER_ENABLED:
+        return json.dumps({
+            "error": "browser tool unavailable: the optional browser-harness CLI is not installed",
+        })
     os.makedirs(BH_WORKSPACE, exist_ok=True)
     env = os.environ.copy()
     env["BH_AGENT_WORKSPACE"] = BH_WORKSPACE
     try:
         result = subprocess.run(
-            ["browser-harness"],
+            [config.BROWSER_CMD],
             input=code,
             capture_output=True,
             text=True,
@@ -118,7 +125,7 @@ def tool_browser(code):
     except subprocess.TimeoutExpired:
         return json.dumps({"error": "browser-harness command timed out (300s)"})
     except FileNotFoundError:
-        return json.dumps({"error": "browser-harness not installed. Run: uv tool install browser-harness"})
+        return json.dumps({"error": "browser-harness not found; install it to enable the browser tool"})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -130,11 +137,14 @@ TOOL_MAP = {
     "write_file": tool_write_file,
     "patch": tool_patch,
     "shell": tool_shell,
-    "browser": tool_browser,
     "ask_user": None,  # handled specially in main loop — not dispatched through here
     "write_skill": None,  # handled specially — reloads system prompt
     "load_skill": None,  # handled specially — injects skill content into chat
 }
+
+# The browser tool is optional — only offered when its CLI is installed.
+if config.BROWSER_ENABLED:
+    TOOL_MAP["browser"] = tool_browser
 
 TOOL_ARGS = {
     "ask_user": {
